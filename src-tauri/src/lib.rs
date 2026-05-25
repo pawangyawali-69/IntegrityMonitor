@@ -5,6 +5,7 @@ mod core;
 mod db;
 mod utils;
 mod detection_rules;
+mod forensic;
 
 
 #[cfg(test)]
