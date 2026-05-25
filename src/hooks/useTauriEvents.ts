@@ -46,20 +46,33 @@ export function useTauriEvent<T>(event: string) {
   return data;
 }
 
-export function useLiveDashboardMetrics() {
-  return useTauriCommand<DashboardMetrics>('get_dashboard_metrics');
+export function useLiveDashboardMetrics(): { data: DashboardMetrics | null; loading: boolean; error: string | null; refresh: () => void } {
+  const data = useTauriEvent<DashboardMetrics>('metrics-updated');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(() => {}, []);
+  return { data, loading, error, refresh };
 }
 
-export function useLiveProcesses() {
-  return useTauriCommand<ProcessInfo[]>('get_processes');
+export function useLiveProcesses(): { data: ProcessInfo[] | null; loading: boolean; error: string | null; refresh: () => void } {
+  const data = useTauriEvent<ProcessInfo[]>('processes-updated');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(() => {}, []);
+  return { data, loading, error, refresh };
 }
 
 export function useLiveEmulators() {
-  return useTauriCommand<EmulatorInfo[]>('get_emulator_status');
+  const data = useTauriEvent<EmulatorInfo[]>('emulators-updated');
+  return data;
 }
 
-export function useKernelDriverStatus() {
-  return useTauriCommand<boolean>('get_kernel_driver_status');
+export function useKernelDriverStatus(): { data: DriverStatus | null; loading: boolean; error: string | null; refresh: () => void } {
+  const data = useTauriEvent<DriverStatus>('kernel-status');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback(() => {}, []);
+  return { data, loading, error, refresh };
 }
 
 export interface DashboardMetrics {
@@ -105,6 +118,12 @@ export interface ModuleInfo {
   hash: string;
   isSuspicious: boolean;
   suspicionReasons: string[];
+}
+
+export interface DriverStatus {
+  installed: boolean;
+  running: boolean;
+  version: string;
 }
 
 export interface EmulatorInfo {

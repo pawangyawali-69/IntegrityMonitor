@@ -25,9 +25,6 @@ impl EventBus {
     }
 
     pub fn emit(&self, event: TelemetryEvent) {
-        if self.tx.receiver_count() == 0 {
-            return;
-        }
         let _ = self.tx.send(event);
     }
 

@@ -1,6 +1,10 @@
 mod api;
 mod telemetry;
 mod kernel;
+mod core;
+mod db;
+mod utils;
+mod detection_rules;
 
 #[cfg(test)]
 mod tests;
@@ -26,6 +30,13 @@ pub fn run() {
             // Open a separate read-only database connection for the query API
             let db_path = telemetry::storage::get_db_path();
             let db_reader = telemetry::storage::DatabaseReader::new(&db_path);
+
+            // Create CoreState and start background monitoring
+            let app_handle = app.handle().clone();
+            let state = Arc::new(parking_lot::RwLock::new(
+                crate::core::CoreState::new(bus.clone(), proc_table.clone())
+            ));
+            crate::core::start_background_monitoring(state, app_handle);
 
             app.manage(Arc::new(bus));
             app.manage(proc_table);

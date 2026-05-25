@@ -24,7 +24,7 @@ export function ProcessMonitor() {
   const handleSelectProcess = async (pid: number) => {
     setSelectedPid(pid === selectedPid ? null : pid);
     try {
-      const result = await import('@tauri-apps/api/core').then(m => m.invoke<ModuleInfo[]>('get_process_modules', { pid }));
+      const result = await import('@tauri-apps/api/core').then(m => m.invoke<ModuleInfo[]>('get_process_module_details', { pid }));
       setModules(result);
     } catch {
       setModules([]);

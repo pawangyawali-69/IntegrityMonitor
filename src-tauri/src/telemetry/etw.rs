@@ -13,7 +13,7 @@ const EVENT_PROCESS_CREATE: u16 = 1;
 const EVENT_PROCESS_END: u16 = 2;
 const EVENT_THREAD_CREATE: u16 = 3;
 const EVENT_THREAD_END: u16 = 4;
-const EVENT_IMAGE_LOAD: u16 = 5;
+const EVENT_IMAGE_LOAD: u16 = 10;
 
 static ETW_BUS: OnceLock<EventBus> = OnceLock::new();
 static ETW_PROC_TABLE: OnceLock<ProcessTable> = OnceLock::new();
@@ -241,6 +241,8 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
             .trim_end_matches('\0')
             .to_string();
 
+        let trust_info = Some(crate::telemetry::trust::verify_authenticode(&image_path));
+
         if let Some(bus) = ETW_BUS.get() {
             bus.emit(TelemetryEvent::ImageLoaded {
                 pid,
@@ -249,7 +251,7 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
                 image_base,
                 image_size,
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                trust_info: None,
+                trust_info,
                 pe_anomalies: Vec::new(),
             });
         }

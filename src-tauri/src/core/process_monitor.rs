@@ -19,12 +19,12 @@ fn cached_verify_trust(path: &str) -> (bool, Option<String>) {
         if let Some(entry) = cache.get(path) {
             if now - entry.2 < TRUST_CACHE_TTL {
                 let t = &entry.0;
-                return (t.signed, t.signer.clone());
+                return (t.is_signed, t.signer.clone());
             }
         }
     }
-    let trust = crate::telemetry::trust::verify_trust(path);
-    let result = (trust.signed, trust.signer.clone());
+    let trust = crate::telemetry::trust::verify_authenticode(path);
+    let result = (trust.is_signed, trust.signer.clone());
     if let Ok(mut cache) = TRUST_CACHE.lock() {
         cache.insert(path.to_string(), (trust, String::new(), now));
         if cache.len() > 10000 {
@@ -55,8 +55,9 @@ fn cached_compute_hash(path: &str) -> String {
                 entry.2 = now;
             } else {
                 let default_trust = crate::telemetry::trust::TrustInfo {
-                    signed: false, signer: None, issuer: None,
-                    chain_status: "unknown".into(), certificate_chain: Vec::new(),
+                    is_signed: false, is_microsoft: false, signer: None, issuer: None,
+                    thumbprint: None, chain_status: "unknown".into(),
+                    timestamp: None, revocation_status: "unchecked".into(),
                 };
                 cache.insert(path_key, (default_trust, hash.clone(), now));
             }

@@ -70,7 +70,7 @@ impl CoreState {
                 let ebus = event_bus.clone();
                 let ptable = proc_table.clone();
                 return Self {
-                    monitoring_active: false,
+                    monitoring_active: true,
                     is_admin: admin,
                     event_bus,
                     proc_table,
@@ -98,7 +98,7 @@ impl CoreState {
         _ = db;
 
         Self {
-            monitoring_active: false,
+            monitoring_active: true,
             is_admin: admin,
             event_bus: event_bus.clone(),
             proc_table: proc_table.clone(),

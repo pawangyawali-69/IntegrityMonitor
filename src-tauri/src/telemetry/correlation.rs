@@ -29,29 +29,40 @@ impl CorrelationActor {
 
     pub async fn run(&mut self) {
         loop {
-            match self.event_rx.recv().await {
-                Ok(event) => {
-                    self.ingest_event(event);
+            tokio::select! {
+                result = self.event_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            self.ingest_event(event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("Correlation actor lagged by {} events", n);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("Correlation actor lagged by {} events", n);
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    // Periodic window cleanup even without events
+                    prune_window(&mut self.process_window, std::time::Duration::from_secs(300));
+                    prune_window(&mut self.image_window, std::time::Duration::from_secs(300));
+                    prune_window(&mut self.file_window, std::time::Duration::from_secs(300));
+                    prune_window(&mut self.net_window, std::time::Duration::from_secs(300));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     }
 
     fn ingest_event(&mut self, event: TelemetryEvent) {
         let now = Instant::now();
-        let _ts = match &event {
-            TelemetryEvent::ProcessCreated { timestamp, .. } => timestamp.clone(),
-            TelemetryEvent::ImageLoaded { timestamp, .. } => timestamp.clone(),
-            TelemetryEvent::FileChanged { timestamp, .. } => timestamp.clone(),
-            TelemetryEvent::NetworkConnection { timestamp, .. } => timestamp.clone(),
-            TelemetryEvent::SuspiciousActivity { timestamp, .. } => timestamp.clone(),
-            TelemetryEvent::IntegrityAlert { timestamp, .. } => timestamp.clone(),
+        match &event {
+            TelemetryEvent::ProcessCreated { .. }
+            | TelemetryEvent::ImageLoaded { .. }
+            | TelemetryEvent::FileChanged { .. }
+            | TelemetryEvent::NetworkConnection { .. }
+            | TelemetryEvent::SuspiciousActivity { .. }
+            | TelemetryEvent::IntegrityAlert { .. } => {}
             _ => return,
-        };
+        }
 
         match &event {
             TelemetryEvent::ProcessCreated { .. } => {
@@ -264,6 +275,10 @@ impl CorrelationActor {
                 }
             }
         }
+    }
+
+    pub fn get_chains(&self) -> Vec<crate::core::CorrelationEvent> {
+        Vec::new()
     }
 
     fn emit_detection(&self, rule_name: &str, severity: &str, description: &str, pid: u32, process_name: String, evidence: Vec<String>) {
