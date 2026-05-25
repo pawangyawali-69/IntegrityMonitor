@@ -2,6 +2,9 @@ mod api;
 mod telemetry;
 mod kernel;
 
+#[cfg(test)]
+mod tests;
+
 use tauri::Manager;
 use std::sync::Arc;
 

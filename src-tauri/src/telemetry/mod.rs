@@ -164,21 +164,28 @@ pub fn initialize_platform() -> (EventBus, ProcessTable) {
 
     let bus_clone = bus.clone();
     let proc_clone = proc_table.clone();
-    tokio::spawn(async move {
-        etw::run_etw_consumer(bus_clone, proc_clone).await;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create ETW runtime");
+        rt.block_on(etw::run_etw_consumer(bus_clone, proc_clone));
     });
 
     let bus_clone = bus.clone();
-    tokio::spawn(async move {
-        let mut actor = storage::StorageActor::new(bus_clone);
-        actor.run().await;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create storage runtime");
+        rt.block_on(async move {
+            let mut actor = storage::StorageActor::new(bus_clone);
+            actor.run().await;
+        });
     });
 
     let bus_clone = bus.clone();
     let proc_clone = proc_table.clone();
-    tokio::spawn(async move {
-        let mut actor = correlation::CorrelationActor::new(bus_clone, proc_clone);
-        actor.run().await;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create correlation runtime");
+        rt.block_on(async move {
+            let mut actor = correlation::CorrelationActor::new(bus_clone, proc_clone);
+            actor.run().await;
+        });
     });
 
     (bus, proc_table)

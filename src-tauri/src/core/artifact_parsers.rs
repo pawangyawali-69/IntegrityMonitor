@@ -531,10 +531,12 @@ fn parse_volume_info(data: &[u8], header: &PfHeader) -> Vec<VolumeInfo> {
 
 fn parse_strings_section(data: &[u8], header: &PfHeader) -> Vec<String> {
     let mut strings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     if header.trace_chain_count == 0 || header.trace_chain_offset as usize >= data.len() {
         return strings;
     }
 
+    // Phase 1: parse trace chain entry names (DLL paths referenced by the process)
     let mut offset = header.trace_chain_offset as usize;
     for _ in 0..header.trace_chain_count {
         if offset + 16 > data.len() { break; }
@@ -547,14 +549,45 @@ fn parse_strings_section(data: &[u8], header: &PfHeader) -> Vec<String> {
                 .chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
             let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
             let s = String::from_utf16_lossy(&wide[..end]);
-            if !s.trim().is_empty() {
-                strings.push(s);
+            let trimmed = s.trim().to_string();
+            if !trimmed.is_empty() && seen.insert(trimmed.clone()) {
+                strings.push(trimmed);
             }
         }
         let next_off = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
         if next_off == 0 { break; }
         offset += next_off as usize;
     }
+
+    // Phase 2: after trace chains end, try to read file metrics strings table
+    // Win10 v30+ stores referenced file paths as wide strings after the trace chains.
+    // Entry format: [4B hash][4B string_offset] followed by wide string data.
+    if offset + 8 < data.len() {
+        let mut tbl_off = offset;
+        let tbl_end = data.len().saturating_sub(4);
+        while tbl_off + 12 <= tbl_end {
+            let hash = u32::from_le_bytes([data[tbl_off], data[tbl_off+1], data[tbl_off+2], data[tbl_off+3]]);
+            let str_off = u32::from_le_bytes([data[tbl_off+4], data[tbl_off+5], data[tbl_off+6], data[tbl_off+7]]);
+            if hash == 0 || str_off == 0 || str_off as usize > data.len() - tbl_off { break; }
+            let raw_start = tbl_off + str_off as usize;
+            if raw_start + 2 > data.len() { break; }
+            let max_len = ((data.len() - raw_start) / 2 * 2).min(520);
+            let wide: Vec<u16> = data[raw_start..raw_start + max_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .take_while(|&c| c != 0)
+                .collect();
+            if !wide.is_empty() {
+                let s = String::from_utf16_lossy(&wide);
+                let trimmed = s.trim().to_string();
+                if !trimmed.is_empty() && trimmed.len() > 3 && seen.insert(trimmed.clone()) {
+                    strings.push(trimmed);
+                }
+            }
+            tbl_off += 12;
+        }
+    }
+
     strings
 }
 

@@ -48,9 +48,8 @@ fn verify_trust(path: &str) -> std::result::Result<TrustInfo, String> {
         wtd.Anonymous.pFile = &mut file_info as *mut WINTRUST_FILE_INFO;
         wtd.dwUIChoice = WTD_UI_NONE;
         wtd.fdwRevocationChecks = WTD_REVOKE_NONE;
-        wtd.dwStateAction = WTD_STATEACTION_IGNORE;
-        wtd.dwProvFlags = WTD_SAFER_FLAG
-            | WTD_CACHE_ONLY_URL_RETRIEVAL;
+        wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+        wtd.dwProvFlags = WTD_SAFER_FLAG;
 
         let mut guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         let status = WinVerifyTrust(
@@ -59,7 +58,7 @@ fn verify_trust(path: &str) -> std::result::Result<TrustInfo, String> {
             &mut wtd as *mut WINTRUST_DATA as *mut std::ffi::c_void,
         );
 
-        if status == 0 {
+        let result = if status == 0 {
             Ok(extract_cert_info(path))
         } else {
             let code = status as u32;
@@ -73,7 +72,17 @@ fn verify_trust(path: &str) -> std::result::Result<TrustInfo, String> {
                 _ => "unknown_error",
             };
             Err(format!("WinVerifyTrust: {} (0x{:08X})", error_desc, code))
-        }
+        };
+
+        // Close the WTD state to release resources
+        wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            &mut guid,
+            &mut wtd as *mut WINTRUST_DATA as *mut std::ffi::c_void,
+        );
+
+        result
     }
 }
 
@@ -98,15 +107,19 @@ fn extract_cert_info(path: &str) -> TrustInfo {
             CERT_QUERY_CONTENT_FLAG_ALL,
             CERT_QUERY_FORMAT_FLAG_ALL,
             0,
-            Some(&mut encoding as *mut CERT_QUERY_ENCODING_TYPE),
-            Some(&mut content_type as *mut CERT_QUERY_CONTENT_TYPE),
-            Some(&mut format_type as *mut CERT_QUERY_FORMAT_TYPE),
-            Some(&mut h_store as *mut HCERTSTORE),
+            Some(&mut encoding),
+            Some(&mut content_type),
+            Some(&mut format_type),
+            Some(&mut h_store),
             Some(&mut h_msg),
             Some(&mut h_context),
         );
 
-        if status.is_err() || h_context.is_null() || h_store.0.is_null() {
+        // For PKCS7 signed messages (content type 10 = CERT_QUERY_CONTENT_PKCS7_SIGNED_MSG),
+        // h_context is not set (NULL) but h_store contains the certificates.
+        let has_store = !h_store.0.is_null();
+        let has_context = !h_context.is_null();
+        if status.is_err() || (!has_store && !has_context) {
             return TrustInfo {
                 is_signed: true,
                 is_microsoft: false,
@@ -119,20 +132,26 @@ fn extract_cert_info(path: &str) -> TrustInfo {
             };
         }
 
-        let cert_ctx = CertFindCertificateInStore(
-            h_store,
-            encoding,
-            0,
-            CERT_FIND_ANY,
-            Some(std::ptr::null()),
-            None,
-        );
+        let cert_ctx = if has_context {
+            // Use the decoded context directly
+            h_context as *const CERT_CONTEXT
+        } else {
+            // Use the first cert from the store
+            CertFindCertificateInStore(
+                h_store,
+                encoding,
+                0,
+                CERT_FIND_ANY,
+                Some(std::ptr::null()),
+                None,
+            )
+        };
 
         let (signer, issuer, thumbprint, is_microsoft) = if !cert_ctx.is_null() {
-            let subj = get_name_str(&*cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE);
-            let iss = get_name_str(&*cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE);
-            let tp = get_thumbprint(&*cert_ctx);
-            let ms = is_microsoft_signed(&*cert_ctx);
+            let subj = get_name_str(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE);
+            let iss = get_name_str(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE);
+            let tp = get_thumbprint(cert_ctx);
+            let ms = is_microsoft_signed(cert_ctx);
             (subj, iss, tp, ms)
         } else {
             (None, None, None, false)
@@ -153,9 +172,9 @@ fn extract_cert_info(path: &str) -> TrustInfo {
     }
 }
 
-unsafe fn get_name_str(cert: &CERT_CONTEXT, name_type: u32) -> Option<String> {
+unsafe fn get_name_str(cert: *const CERT_CONTEXT, name_type: u32) -> Option<String> {
     let needed = CertGetNameStringW(
-        cert as *const CERT_CONTEXT,
+        cert,
         name_type,
         0,
         None,
@@ -165,7 +184,7 @@ unsafe fn get_name_str(cert: &CERT_CONTEXT, name_type: u32) -> Option<String> {
 
     let mut buf = vec![0u16; needed as usize];
     let _written = CertGetNameStringW(
-        cert as *const CERT_CONTEXT,
+        cert,
         name_type,
         0,
         None,
@@ -176,10 +195,10 @@ unsafe fn get_name_str(cert: &CERT_CONTEXT, name_type: u32) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-unsafe fn get_thumbprint(cert: &CERT_CONTEXT) -> Option<String> {
+unsafe fn get_thumbprint(cert: *const CERT_CONTEXT) -> Option<String> {
     let mut count: u32 = 0;
     let ret = CertGetCertificateContextProperty(
-        cert as *const CERT_CONTEXT as *mut CERT_CONTEXT,
+        cert as *mut CERT_CONTEXT,
         CERT_SHA1_HASH_PROP_ID,
         None,
         &mut count,
@@ -187,7 +206,7 @@ unsafe fn get_thumbprint(cert: &CERT_CONTEXT) -> Option<String> {
     if ret.is_err() || count == 0 { return None; }
     let mut buf = vec![0u8; count as usize];
     let _ = CertGetCertificateContextProperty(
-        cert as *const CERT_CONTEXT as *mut CERT_CONTEXT,
+        cert as *mut CERT_CONTEXT,
         CERT_SHA1_HASH_PROP_ID,
         Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
         &mut count,
@@ -195,7 +214,7 @@ unsafe fn get_thumbprint(cert: &CERT_CONTEXT) -> Option<String> {
     Some(hex::encode(&buf))
 }
 
-unsafe fn is_microsoft_signed(cert: &CERT_CONTEXT) -> bool {
+unsafe fn is_microsoft_signed(cert: *const CERT_CONTEXT) -> bool {
     if let Some(name) = get_name_str(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE) {
         let lower = name.to_lowercase();
         lower.contains("microsoft") || lower.contains("windows")

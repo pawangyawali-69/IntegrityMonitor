@@ -1,0 +1,34 @@
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ManufacturerName%
+DriverVer=05/23/2026,1.0.0
+CatalogFile=IntegrityMonitor.cat
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%IntegrityMonitor.DeviceDesc%=IntegrityMonitor, Root\IntegrityMonitor
+
+[IntegrityMonitor.NT]
+CopyFiles=IntegrityMonitor.Files
+
+[IntegrityMonitor.NT.Services]
+AddService = IntegrityMonitor, 0x00000002, IntegrityMonitor.Service
+
+[IntegrityMonitor.Files]
+IntegrityMonitor.sys
+
+[IntegrityMonitor.Service]
+DisplayName    = %IntegrityMonitor.SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ImagePath      = %12%\IntegrityMonitor.sys
+
+[Strings]
+ManufacturerName="IntegrityMonitor"
+IntegrityMonitor.DeviceDesc="IntegrityMonitor Kernel Telemetry Driver"
+IntegrityMonitor.SvcDesc="IntegrityMonitor - System Telemetry Collection"

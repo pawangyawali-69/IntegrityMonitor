@@ -6,7 +6,7 @@ import { Input } from '../ui/input';
 import { ScrollArea } from '../ui/scroll-area';
 import { Search, AlertTriangle, Loader2 } from 'lucide-react';
 
-export default function ProcessMonitor() {
+export function ProcessMonitor() {
   const { data: processes, loading, error } = useLiveProcesses();
   const [searchQuery, setSearchQuery] = useState('');
   const [suspiciousOnly, setSuspiciousOnly] = useState(false);

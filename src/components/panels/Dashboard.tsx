@@ -5,7 +5,7 @@ import { Progress } from '../ui/progress';
 import { ScrollArea } from '../ui/scroll-area';
 import { Activity, AlertTriangle, Cpu, HardDrive, Network, Shield, Users } from 'lucide-react';
 
-export default function Dashboard() {
+export function Dashboard() {
   const { data: metrics, loading: metricsLoading } = useLiveDashboardMetrics();
   const processes = useLiveProcesses();
   const { data: kernelStatus } = useKernelDriverStatus();
