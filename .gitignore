@@ -1,0 +1,25 @@
+# Rust
+target/
+**/*.rs.bk
+
+
+# Tauri
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+package-lock.json
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.pyc

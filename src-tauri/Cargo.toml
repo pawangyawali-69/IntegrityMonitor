@@ -1,0 +1,64 @@
+[package]
+name = "integrity-monitor"
+version = "1.0.0"
+edition = "2021"
+description = "Windows Forensic Integrity Monitoring Platform — EDR, anti-cheat, telemetry & DFIR"
+
+[lib]
+name = "integrity_monitor_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tantivy = "0.22"
+yara-x = "0.2"
+windows = { version = "0.54", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+dashmap = "5.5"
+thiserror = "1"
+walkdir = "2"
+hex = "0.4"
+sysinfo = "0.30"
+crossbeam = "0.8"
+crc32fast = "1.4"
+once_cell = "1.19"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

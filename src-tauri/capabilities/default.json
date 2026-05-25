@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for IntegrityMonitor",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "dialog:default",
+    "fs:default"
+  ]
+}
