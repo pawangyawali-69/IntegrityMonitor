@@ -163,3 +163,200 @@ pub fn stop_monitoring() -> Result<(), String> {
     log::info!("Monitoring stop requested (ETW continues until app exit)");
     Ok(())
 }
+
+// --- Thread Inspector ---
+
+#[tauri::command]
+pub fn get_process_threads(pid: u32) -> Vec<serde_json::Value> {
+    let threads = crate::core::thread_inspector::enumerate_threads(pid);
+    threads.into_iter().map(|t| {
+        serde_json::json!({
+            "tid": t.tid,
+            "pid": t.pid,
+            "basePriority": t.base_priority,
+            "deltaPriority": t.delta_priority,
+            "state": t.state,
+            "waitReason": t.wait_reason,
+            "startAddress": t.start_address,
+            "isAlive": t.is_alive,
+            "isSuspended": t.is_suspended,
+            "tebBase": t.teb_base,
+            "stackBase": t.stack_base,
+            "stackLimit": t.stack_limit,
+        })
+    }).collect()
+}
+
+// --- Handle Inspector ---
+
+#[tauri::command]
+pub fn get_process_handles(pid: u32) -> Result<Vec<serde_json::Value>, String> {
+    let handles = crate::core::handle_inspector::get_process_handles(pid)?;
+    Ok(handles.into_iter().map(|h| {
+        serde_json::json!({
+            "handle": h.handle,
+            "pid": h.pid,
+            "objectType": h.object_type,
+            "objectAddress": h.object_address,
+            "grantedAccess": h.granted_access,
+            "handleAttributes": h.handle_attributes,
+        })
+    }).collect())
+}
+
+#[tauri::command]
+pub fn get_system_handles() -> Result<Vec<serde_json::Value>, String> {
+    let handles = crate::core::handle_inspector::enumerate_system_handles()?;
+    // Return top 500 to avoid large payloads
+    Ok(handles.into_iter().take(500).map(|h| {
+        serde_json::json!({
+            "handle": h.handle,
+            "pid": h.pid,
+            "objectType": h.object_type,
+            "grantedAccess": h.granted_access,
+        })
+    }).collect())
+}
+
+// --- Memory Analysis ---
+
+#[tauri::command]
+pub fn get_memory_regions(pid: u32) -> Vec<serde_json::Value> {
+    let regions = crate::telemetry::memory::enumerate_memory_regions(pid);
+    regions.into_iter().map(|r| {
+        serde_json::json!({
+            "baseAddress": format!("0x{:X}", r.base_address),
+            "size": r.size,
+            "state": r.state,
+            "protect": r.protect,
+            "type": r.type_,
+            "isSuspicious": r.is_suspicious,
+            "hasPeHeader": r.has_pe_header,
+            "mappedFile": r.mapped_file,
+        })
+    }).collect()
+}
+
+#[tauri::command]
+pub fn dump_process_memory(pid: u32) -> Result<serde_json::Value, String> {
+    let info = crate::telemetry::memory::dump_process_memory(pid, &std::env::temp_dir().join("memory_dumps").to_string_lossy())?;
+    Ok(serde_json::json!({
+        "pid": info.pid,
+        "dumpSize": info.dump_size,
+        "regionsDumped": info.regions_dumped,
+        "path": info.path,
+    }))
+}
+
+#[tauri::command]
+pub fn detect_pe_in_memory(pid: u32) -> Vec<serde_json::Value> {
+    let regions = crate::telemetry::memory::detect_pe_in_memory(pid);
+    regions.into_iter().map(|r| {
+        serde_json::json!({
+            "baseAddress": format!("0x{:X}", r.base_address),
+            "size": r.size,
+            "protect": r.protect,
+            "type": r.type_,
+            "mappedFile": r.mapped_file,
+        })
+    }).collect()
+}
+
+// --- String Extraction ---
+
+#[tauri::command]
+pub fn extract_process_strings(pid: u32) -> Vec<serde_json::Value> {
+    let strings = crate::core::string_extractor::extract_strings(pid, None);
+    strings.into_iter().take(200).map(|s| {
+        serde_json::json!({
+            "value": s.value,
+            "encoding": s.encoding,
+            "address": format!("0x{:X}", s.address),
+            "size": s.size,
+            "entropy": format!("{:.3}", s.entropy),
+        })
+    }).collect()
+}
+
+#[tauri::command]
+pub fn extract_process_iocs(pid: u32) -> Vec<serde_json::Value> {
+    let iocs = crate::core::string_extractor::scan_for_iocs(pid);
+    iocs.into_iter().take(50).map(|s| {
+        serde_json::json!({
+            "value": s.value,
+            "encoding": s.encoding,
+            "address": format!("0x{:X}", s.address),
+            "entropy": format!("{:.3}", s.entropy),
+        })
+    }).collect()
+}
+
+// --- Network (Extended) ---
+
+#[tauri::command]
+pub fn get_all_network_connections() -> Vec<serde_json::Value> {
+    let conns = crate::telemetry::network::get_all_connections();
+    conns.into_iter().map(|c| {
+        serde_json::json!({
+            "pid": c.pid,
+            "localAddr": c.local_addr,
+            "localPort": c.local_port,
+            "remoteAddr": c.remote_addr,
+            "remotePort": c.remote_port,
+            "state": c.state,
+            "protocol": c.protocol,
+            "processName": c.process_name,
+        })
+    }).collect()
+}
+
+// --- Injection Detection ---
+
+#[tauri::command]
+pub fn get_injection_indicators() -> Vec<serde_json::Value> {
+    // Take processes from the CoreState via the monitoring snapshot
+    // For now return empty — will be populated live
+    Vec::new()
+}
+
+// --- Process Tree ---
+
+#[tauri::command]
+pub fn get_process_tree(proc_table: State<'_, crate::telemetry::ProcessTable>) -> Vec<serde_json::Value> {
+    let all: Vec<_> = proc_table.iter().map(|entry| {
+        let p = entry.value();
+        serde_json::json!({
+            "pid": p.pid,
+            "parentPid": p.parent_pid,
+            "name": p.name,
+            "path": p.path,
+            "isAlive": p.is_alive,
+        })
+    }).collect();
+
+    let children_map: std::collections::HashMap<u32, Vec<serde_json::Value>> = {
+        let mut map: std::collections::HashMap<u32, Vec<serde_json::Value>> = std::collections::HashMap::new();
+        for proc in &all {
+            let parent_pid = proc.get("parentPid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            map.entry(parent_pid).or_default().push(proc.clone());
+        }
+        map
+    };
+
+    fn build_tree(pid: u32, children_map: &std::collections::HashMap<u32, Vec<serde_json::Value>>) -> Vec<serde_json::Value> {
+        let mut tree = Vec::new();
+        if let Some(children) = children_map.get(&pid) {
+            for child in children {
+                let mut node = child.clone();
+                let child_pid = child.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                node.as_object_mut().map(|obj| {
+                    obj.insert("children".into(), serde_json::Value::Array(build_tree(child_pid, children_map)));
+                });
+                tree.push(node);
+            }
+        }
+        tree
+    }
+
+    build_tree(0, &children_map)
+}

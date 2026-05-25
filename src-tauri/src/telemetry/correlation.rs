@@ -53,6 +53,7 @@ impl CorrelationActor {
     }
 
     fn ingest_event(&mut self, event: TelemetryEvent) {
+        CORR_EVENTS_PROCESSED.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         match &event {
             TelemetryEvent::ProcessCreated { .. }
@@ -60,7 +61,8 @@ impl CorrelationActor {
             | TelemetryEvent::FileChanged { .. }
             | TelemetryEvent::NetworkConnection { .. }
             | TelemetryEvent::SuspiciousActivity { .. }
-            | TelemetryEvent::IntegrityAlert { .. } => {}
+            | TelemetryEvent::IntegrityAlert { .. }
+            | TelemetryEvent::SystemHealth { .. } => {}
             _ => return,
         }
 
@@ -302,4 +304,13 @@ fn prune_window(window: &mut VecDeque<(Instant, TelemetryEvent)>, max_age: Durat
             break;
         }
     }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(crate) static CORR_EVENTS_PROCESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Incremented on every event ingested. Used by SystemSupervisor for liveness.
+pub fn corr_events_processed() -> u64 {
+    CORR_EVENTS_PROCESSED.load(Ordering::Relaxed)
 }

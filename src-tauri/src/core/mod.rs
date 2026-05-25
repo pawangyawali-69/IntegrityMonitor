@@ -7,6 +7,12 @@ pub mod scoring;
 pub mod search_engine;
 pub mod emulator_monitor;
 pub mod artifact_parsers;
+pub mod supervisor;
+pub mod thread_inspector;
+pub mod handle_inspector;
+pub mod string_extractor;
+pub mod injection_detector;
+pub mod rootkit_detector;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize};
@@ -197,6 +203,22 @@ pub struct ProcessInfo {
     pub integrity_level: String,
     pub is_emulator_related: bool,
     pub modules: Vec<ModuleInfo>,
+    pub children: Vec<u32>,
+    pub threads: Vec<ThreadInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadInfo {
+    pub tid: u32,
+    pub start_address: Option<u64>,
+    pub is_alive: bool,
+}
+
+impl ProcessInfo {
+    pub fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -288,7 +310,7 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
         let mut tick: u64 = 0;
 
         loop {
-            let processes: Vec<ProcessInfo>;
+            let mut processes: Vec<ProcessInfo>;
             let ev_count: usize;
             let ac_detections: usize;
             let correlation_count: usize;
@@ -303,6 +325,20 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
                 let is_admin = s.is_admin;
                 processes = s.process_monitor.refresh_process_list(is_admin);
 
+                // Build process tree: populate children lists
+                let child_map: std::collections::HashMap<u32, Vec<u32>> = {
+                    let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+                    for p in &processes {
+                        map.entry(p.parent_pid).or_default().push(p.pid);
+                    }
+                    map
+                };
+                for p in &mut processes {
+                    if let Some(children) = child_map.get(&p.pid) {
+                        p.children = children.clone();
+                    }
+                }
+
                 let current_pids: Vec<u32> = processes.iter().map(|p| p.pid).collect();
                 let new_pids: Vec<u32> = current_pids.iter()
                     .filter(|p| !known_pids.contains(p)).copied().collect();
@@ -313,6 +349,45 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
 
                 let detection_summary = s.detection_engine.evaluate_all(&processes);
                 s.anomaly_tracker.record(detection_summary.overall_risk_score);
+
+                // Injection detection
+                let injections = crate::core::injection_detector::detect_injections(&processes);
+                for inj in &injections {
+                    if inj.confidence > 0.3 {
+                        s.timeline.add_event(TimelineEvent {
+                            id: uuid::Uuid::new_v4().to_string(), timestamp: ts.clone(),
+                            event_type: "injection_detection".into(), category: "detection".into(),
+                            description: format!("{} (confidence: {:.2}): {}", inj.technique, inj.confidence, inj.evidence.join("; ")),
+                            severity: inj.severity.clone(), source: "injection_detector".into(),
+                            process_name: Some(inj.process_name.clone()), pid: Some(inj.pid), path: None,
+                            details: serde_json::json!(inj),
+                        });
+                        s.event_bus.emit(crate::telemetry::TelemetryEvent::SuspiciousActivity {
+                            rule_name: inj.technique.clone(),
+                            severity: inj.severity.clone(),
+                            description: format!("Injection: {} (confidence: {:.2})", inj.technique, inj.confidence),
+                            pid: inj.pid, process_name: inj.process_name.clone(),
+                            evidence: inj.evidence.clone(), timestamp: ts.clone(),
+                        });
+                    }
+                }
+
+                // Rootkit detection (periodic, every 10 ticks)
+                if tick % 10 == 0 {
+                    let rootkits = crate::core::rootkit_detector::detect_rootkits(&processes);
+                    for rk in &rootkits {
+                        if rk.confidence > 0.3 {
+                            s.timeline.add_event(TimelineEvent {
+                                id: uuid::Uuid::new_v4().to_string(), timestamp: ts.clone(),
+                                event_type: "rootkit_detection".into(), category: "detection".into(),
+                                description: format!("{} (confidence: {:.2}): {}", rk.technique, rk.confidence, rk.evidence.join("; ")),
+                                severity: rk.severity.clone(), source: "rootkit_detector".into(),
+                                process_name: None, pid: None, path: None,
+                                details: serde_json::json!(rk),
+                            });
+                        }
+                    }
+                }
 
                 if s.anomaly_tracker.is_anomalous() {
                     let z = s.anomaly_tracker.z_score();

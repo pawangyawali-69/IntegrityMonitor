@@ -68,6 +68,7 @@ fn cached_compute_hash(path: &str) -> String {
 
 pub struct ProcessMonitor {
     snapshot: HashMap<u32, ProcessInfo>,
+    prev_cpu: HashMap<u32, (f32, std::time::Instant)>,
     emulator_patterns: Vec<String>,
     system: sysinfo::System,
 }
@@ -76,6 +77,7 @@ impl ProcessMonitor {
     pub fn new() -> Self {
         Self {
             snapshot: HashMap::new(),
+            prev_cpu: HashMap::new(),
             emulator_patterns: vec![
                 "HD-Player.exe".into(),
                 "BlueStacks.exe".into(),
@@ -92,6 +94,7 @@ impl ProcessMonitor {
     pub fn refresh_process_list(&mut self, load_modules: bool) -> Vec<ProcessInfo> {
         let mut processes = Vec::new();
         self.system.refresh_all();
+        let now = std::time::Instant::now();
 
         for (pid, process) in self.system.processes() {
             let pid_u32 = pid.as_u32();
@@ -114,13 +117,27 @@ impl ProcessMonitor {
                 Vec::new()
             };
 
+            let raw_cpu = process.cpu_usage();
+            let cpu_delta = if let Some(&(prev_cpu, prev_time)) = self.prev_cpu.get(&pid_u32) {
+                let elapsed = (now - prev_time).as_secs_f64();
+                if elapsed > 0.0 {
+                    ((raw_cpu - prev_cpu) as f64 / elapsed).max(0.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let cpu_usage = if cpu_delta > 0.0 { cpu_delta } else { raw_cpu as f64 };
+            self.prev_cpu.insert(pid_u32, (raw_cpu, now));
+
             let info = ProcessInfo {
                 pid: pid_u32,
                 parent_pid,
                 name: exe_name.clone(),
                 path: process.exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
                 command_line: process.cmd().join(" "),
-                cpu_usage: process.cpu_usage() as f64,
+                cpu_usage,
                 memory_usage: process.memory(),
                 thread_count: 0,
                 handle_count: 0,
@@ -132,9 +149,15 @@ impl ProcessMonitor {
                 integrity_level: "unknown".into(),
                 is_emulator_related: self.is_emulator_process(&exe_name),
                 modules,
+                children: Vec::new(),
+                threads: Vec::new(),
             };
             processes.push(info);
         }
+
+        self.prev_cpu.retain(|pid, _| {
+            processes.iter().any(|p| p.pid == *pid)
+        });
 
         self.snapshot = processes.iter().map(|p| (p.pid, p.clone())).collect();
         processes

@@ -6,6 +6,7 @@ mod db;
 mod utils;
 mod detection_rules;
 
+
 #[cfg(test)]
 mod tests;
 
@@ -27,9 +28,16 @@ pub fn run() {
 
             let (bus, proc_table) = telemetry::initialize_platform();
 
+            // Replay unprocessed journal events to rebuild correlation state
+            telemetry::journal::replay_journal(&bus);
+
             // Open a separate read-only database connection for the query API
             let db_path = telemetry::storage::get_db_path();
             let db_reader = telemetry::storage::DatabaseReader::new(&db_path);
+
+            // Start SystemSupervisor (health checks every 15s)
+            let supervisor = core::supervisor::SystemSupervisor::new(bus.clone(), proc_table.clone());
+            supervisor.run();
 
             // Create CoreState and start background monitoring
             let app_handle = app.handle().clone();
@@ -62,6 +70,17 @@ pub fn run() {
             api::commands::get_system_overview,
             api::commands::start_monitoring,
             api::commands::stop_monitoring,
+            api::commands::get_process_threads,
+            api::commands::get_process_handles,
+            api::commands::get_system_handles,
+            api::commands::get_memory_regions,
+            api::commands::dump_process_memory,
+            api::commands::detect_pe_in_memory,
+            api::commands::extract_process_strings,
+            api::commands::extract_process_iocs,
+            api::commands::get_all_network_connections,
+            api::commands::get_injection_indicators,
+            api::commands::get_process_tree,
         ])
         .run(tauri::generate_context!())
         .expect("error while running IntegrityMonitor");

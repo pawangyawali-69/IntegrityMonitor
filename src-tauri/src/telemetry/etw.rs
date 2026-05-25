@@ -1,7 +1,10 @@
 use crate::telemetry::{EventBus, TelemetryEvent, ProcessTable, ProcessState};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::System::Diagnostics::Etw::*;
 use windows::Win32::Foundation::*;
+
+pub(crate) static ETW_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Kernel-Process provider GUID: {22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}
 static KERNEL_PROCESS_PROVIDER: windows::core::GUID = windows::core::GUID {
@@ -17,6 +20,115 @@ const EVENT_IMAGE_LOAD: u16 = 10;
 
 static ETW_BUS: OnceLock<EventBus> = OnceLock::new();
 static ETW_PROC_TABLE: OnceLock<ProcessTable> = OnceLock::new();
+
+// Trust verification worker infrastructure
+use crossbeam::channel;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+pub struct TrustVerifyJob {
+    pid: u32,
+    image_path: String,
+    image_base: u64,
+    image_size: u64,
+}
+
+static VERIFY_TX: OnceLock<channel::Sender<TrustVerifyJob>> = OnceLock::new();
+
+// Shared trust cache: path -> (TrustInfo, timestamp)
+static VERIFY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (crate::telemetry::trust::TrustInfo, Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const CACHE_TTL: Duration = Duration::from_secs(300);
+const CACHE_MAX_ENTRIES: usize = 5000;
+
+pub(crate) static TRUST_EVENTS_PROCESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the trust verification worker channel. Returns the receiver.
+/// Called once during platform initialization.
+pub fn init_trust_worker() -> channel::Receiver<TrustVerifyJob> {
+    let (tx, rx) = channel::unbounded();
+    VERIFY_TX.set(tx).expect("Trust worker already initialized");
+    rx
+}
+
+/// Submit a verification job from the ETW callback (non-blocking).
+/// Checks the cache first; only enqueues on cache miss.
+pub fn submit_trust_verification(pid: u32, image_path: &str, image_base: u64, image_size: u64) {
+    if let Some(tx) = VERIFY_TX.get() {
+        let cached = {
+            let cache = VERIFY_CACHE.lock().unwrap();
+            cache.get(image_path)
+                .map(|(_, ts)| ts.elapsed() < CACHE_TTL)
+                .unwrap_or(false)
+        };
+
+        if !cached {
+            let _ = tx.try_send(TrustVerifyJob {
+                pid,
+                image_path: image_path.to_string(),
+                image_base,
+                image_size,
+            });
+        }
+    }
+}
+
+/// Run the trust verification worker in the current thread.
+/// Processes jobs from the channel, calls verify_authenticode, emits enriched events.
+pub fn run_trust_worker(rx: channel::Receiver<TrustVerifyJob>, bus: EventBus) {
+    log::info!("Trust verification worker started");
+    for job in rx {
+        // Check cache again (might have been populated by poll-based verification)
+        let trust_info = {
+            let mut cache = VERIFY_CACHE.lock().unwrap();
+
+            // Evict stale entries if cache is large
+            if cache.len() >= CACHE_MAX_ENTRIES {
+                cache.retain(|_, (_, ts)| ts.elapsed() < CACHE_TTL);
+            }
+
+            // Check for existing entry
+            if let Some((ti, ts)) = cache.get(&job.image_path) {
+                if ts.elapsed() < CACHE_TTL {
+                    ti.clone()
+                } else {
+                    drop(cache); // release lock before expensive call
+                    let ti = crate::telemetry::trust::verify_authenticode(&job.image_path);
+                    let mut cache = VERIFY_CACHE.lock().unwrap();
+                    cache.insert(job.image_path.clone(), (ti.clone(), Instant::now()));
+                    ti
+                }
+            } else {
+                drop(cache);
+                let ti = crate::telemetry::trust::verify_authenticode(&job.image_path);
+                let mut cache = VERIFY_CACHE.lock().unwrap();
+                cache.insert(job.image_path.clone(), (ti.clone(), Instant::now()));
+                ti
+            }
+        };
+
+        TRUST_EVENTS_PROCESSED.fetch_add(1, Ordering::Relaxed);
+
+        bus.emit(TelemetryEvent::ImageLoaded {
+            pid: job.pid,
+            process_name: String::new(),
+            image_path: job.image_path,
+            image_base: job.image_base,
+            image_size: job.image_size,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            trust_info: Some(trust_info),
+            pe_anomalies: Vec::new(),
+        });
+    }
+    log::info!("Trust verification worker stopped");
+}
+
+/// Public accessor for supervisor health checks
+pub fn trust_events_processed() -> u64 {
+    TRUST_EVENTS_PROCESSED.load(Ordering::Relaxed)
+}
 
 pub async fn run_etw_consumer(bus: EventBus, proc_table: ProcessTable) {
     ETW_BUS.set(bus).ok();
@@ -84,15 +196,13 @@ fn start_etw_trace() {
 unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
     if event_record.is_null() { return; }
     let rec = unsafe { &*event_record };
+    if rec.EventHeader.ProviderId != KERNEL_PROCESS_PROVIDER { return; }
 
-    if rec.EventHeader.ProviderId != KERNEL_PROCESS_PROVIDER {
-        return;
-    }
+    ETW_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let event_id = rec.EventHeader.EventDescriptor.Id;
     let pid = rec.EventHeader.ProcessId;
     let tid = rec.EventHeader.ThreadId;
-
     let user_data = rec.UserData as *const u8;
     let user_len = rec.UserDataLength as usize;
 
@@ -215,13 +325,11 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
         let image_base_low = *(data.add(0) as *const u32) as u64;
         let image_base_high = if len >= 28 { *(data.add(24) as *const u32) as u64 } else { 0 };
         let image_base = (image_base_high << 32) | image_base_low;
-
         let image_size = *(data.add(4) as *const u32) as u64;
         let _time_stamp = *(data.add(12) as *const u32);
 
         let name_len;
         let name_start: usize;
-
         if len > 30 {
             let off = *(data.add(16) as *const u16) as usize;
             let nl = *(data.add(18) as *const u16) as usize;
@@ -233,16 +341,13 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
 
         if name_start + name_len > len || name_len == 0 { return; }
 
-        let name_wide = std::slice::from_raw_parts(
-            data.add(name_start) as *const u16,
-            name_len / 2,
-        );
-        let image_path = String::from_utf16_lossy(name_wide)
-            .trim_end_matches('\0')
-            .to_string();
+        let name_wide = std::slice::from_raw_parts(data.add(name_start) as *const u16, name_len / 2);
+        let image_path = String::from_utf16_lossy(name_wide).trim_end_matches('\0').to_string();
 
-        let trust_info = Some(crate::telemetry::trust::verify_authenticode(&image_path));
+        // Offload Authenticode verification to background worker (non-blocking)
+        submit_trust_verification(pid, &image_path, image_base, image_size);
 
+        // Emit lightweight event immediately (trust verification is deferred)
         if let Some(bus) = ETW_BUS.get() {
             bus.emit(TelemetryEvent::ImageLoaded {
                 pid,
@@ -251,9 +356,15 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
                 image_base,
                 image_size,
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                trust_info,
+                trust_info: None,
                 pe_anomalies: Vec::new(),
             });
         }
     }
+}
+
+/// Returns the total number of ETW events processed since startup.
+/// Used by SystemSupervisor for liveness monitoring.
+pub fn etw_event_count() -> u64 {
+    ETW_EVENT_COUNT.load(Ordering::Relaxed)
 }

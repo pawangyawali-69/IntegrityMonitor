@@ -2,34 +2,66 @@ pub mod etw;
 pub mod trust;
 pub mod pe;
 pub mod storage;
+pub mod journal;
 pub mod correlation;
 pub mod memory;
 pub mod network;
 pub mod anti_cheat;
 pub mod yara;
 
-
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use dashmap::DashMap;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<TelemetryEvent>,
+    journal_tx: Option<crossbeam::channel::Sender<TelemetryEvent>>,
+    emit_count: Arc<AtomicU64>,
 }
 
 impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            journal_tx: None,
+            emit_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn with_journal(
+        tx: broadcast::Sender<TelemetryEvent>,
+        journal_tx: crossbeam::channel::Sender<TelemetryEvent>,
+    ) -> Self {
+        Self {
+            tx,
+            journal_tx: Some(journal_tx),
+            emit_count: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn emit(&self, event: TelemetryEvent) {
+        self.emit_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(ref jtx) = self.journal_tx {
+            let _ = jtx.try_send(event.clone());
+        }
+        let _ = self.tx.send(event);
+    }
+
+    /// Emit without journaling (used for replay and internal system events)
+    pub fn broadcast(&self, event: TelemetryEvent) {
+        self.emit_count.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(event);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
         self.tx.subscribe()
+    }
+
+    pub fn emit_count(&self) -> u64 {
+        self.emit_count.load(Ordering::Relaxed)
     }
 }
 
@@ -112,6 +144,18 @@ pub enum TelemetryEvent {
         details: String,
         timestamp: String,
     },
+    SystemHealth {
+        uptime_secs: u64,
+        etw_events_processed: u64,
+        corr_events_processed: u64,
+        journal_events_written: u64,
+        trust_events_processed: u64,
+        total_events_emitted: u64,
+        total_events_dropped: u64,
+        seconds_since_last_event: u64,
+        events_per_sec: u64,
+        subsystem_count: u32,
+    },
 }
 
 pub type ProcessTable = Arc<DashMap<u32, ProcessState>>;
@@ -156,8 +200,21 @@ pub struct ThreadState {
 }
 
 pub fn initialize_platform() -> (EventBus, ProcessTable) {
-    let bus = EventBus::new(4096);
+    let (tx, _) = broadcast::channel(4096);
+    let (jtx, jrx) = crossbeam::channel::unbounded();
+    let bus = EventBus::with_journal(tx, jtx);
     let proc_table: ProcessTable = Arc::new(DashMap::new());
+
+    // Start journal worker (persists all events to SQLite)
+    let journal_path = journal::get_journal_path();
+    journal::start_journal_worker(jrx, journal_path);
+
+    // Start trust verification worker (offloads Authenticode from ETW thread)
+    let trust_rx = etw::init_trust_worker();
+    let trust_bus = bus.clone();
+    std::thread::spawn(move || {
+        etw::run_trust_worker(trust_rx, trust_bus);
+    });
 
     let bus_clone = bus.clone();
     let proc_clone = proc_table.clone();
