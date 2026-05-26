@@ -3,10 +3,11 @@ use crate::telemetry::trust::TrustInfo;
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct StorageActor {
     db: Arc<Mutex<rusqlite::Connection>>,
-    event_rx: tokio::sync::broadcast::Receiver<TelemetryEvent>,
+    event_rx: crossbeam::channel::Receiver<TelemetryEvent>,
     batch: Vec<TelemetryEvent>,
 }
 
@@ -144,26 +145,19 @@ impl StorageActor {
 
     pub async fn run(&mut self) {
         loop {
-            tokio::select! {
-                result = self.event_rx.recv() => {
-                    match result {
-                        Ok(event) => {
-                            self.batch.push(event);
-                            if self.batch.len() >= 50 {
-                                self.flush_batch();
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            log::warn!("Storage actor lagged by {} events", n);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            match self.event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(event) => {
+                    self.batch.push(event);
+                    if self.batch.len() >= 50 {
+                        self.flush_batch();
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                     if !self.batch.is_empty() {
                         self.flush_batch();
                     }
                 }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
@@ -171,22 +165,32 @@ impl StorageActor {
     fn flush_batch(&mut self) {
         let batch = std::mem::replace(&mut self.batch, Vec::with_capacity(100));
         let count = batch.len();
+        if count == 0 {
+            return;
+        }
 
         let c = self.db.lock();
+        let tx = match c.unchecked_transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("Failed to start transaction for batch of {} events: {}", count, e);
+                return;
+            }
+        };
         for event in &batch {
-            if let Err(e) = insert_event(&c, event) {
+            if let Err(e) = insert_event(&tx, event) {
                 log::warn!("Failed to insert event: {}", e);
             }
         }
-        drop(c);
-
-        if count > 0 {
-            log::debug!("Stored {} events", count);
+        if let Err(e) = tx.commit() {
+            log::warn!("Failed to commit batch of {} events: {}", count, e);
         }
+
+        log::debug!("Stored {} events in single transaction", count);
     }
 }
 
-fn insert_event(conn: &rusqlite::Connection, event: &TelemetryEvent) -> Result<(), rusqlite::Error> {
+fn insert_event(conn: &rusqlite::Transaction, event: &TelemetryEvent) -> Result<(), rusqlite::Error> {
     match event {
         TelemetryEvent::ProcessCreated { pid, parent_pid, name, path, command_line, session_id, timestamp, user_sid, trust_info } => {
             let (is_signed, is_microsoft, signer) = trust_info_to_fields(trust_info);
@@ -225,6 +229,9 @@ fn insert_event(conn: &rusqlite::Connection, event: &TelemetryEvent) -> Result<(
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![pid, process_name, alert_type, details, timestamp],
             )?;
+        }
+        TelemetryEvent::MemoryChanged { .. } => {
+            // Memory delta events are transient — not persisted to storage
         }
         _ => {}
     }

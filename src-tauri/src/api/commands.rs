@@ -4,6 +4,8 @@ use crate::telemetry::ProcessTable;
 use crate::telemetry::storage::DatabaseReader;
 use crate::telemetry::trust;
 use crate::telemetry::pe;
+use crate::telemetry::envelope::{CategoryFilter, Severity, FrontendSubscription};
+use crate::telemetry::router::TelemetryRouter;
 
 #[tauri::command]
 pub fn get_process_list(proc_table: State<'_, ProcessTable>) -> Vec<serde_json::Value> {
@@ -359,4 +361,30 @@ pub fn get_process_tree(proc_table: State<'_, crate::telemetry::ProcessTable>) -
     }
 
     build_tree(0, &children_map)
+}
+
+#[tauri::command]
+pub fn subscribe_telemetry(
+    router: State<'_, Arc<TelemetryRouter>>,
+    categories: u32,
+    min_severity: u8,
+) -> serde_json::Value {
+    let cat_filter = CategoryFilter::from_bits_truncate(categories);
+    let sev = match min_severity {
+        4 => Severity::Critical, 3 => Severity::High,
+        2 => Severity::Medium, 1 => Severity::Low,
+        _ => Severity::Informational,
+    };
+    router.subscribe(FrontendSubscription {
+        categories: cat_filter,
+        min_severity: sev,
+        process_filter: None,
+        replay_mode: false,
+    });
+    serde_json::json!({
+        "status": "ok",
+        "categories": categories,
+        "severity": min_severity,
+        "subscriber_count": router.subscriber_count(),
+    })
 }

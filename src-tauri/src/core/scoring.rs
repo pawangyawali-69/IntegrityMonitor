@@ -1,126 +1,130 @@
 use crate::core::{SuspicionScore, SuspicionCategory};
+use std::collections::HashMap;
 
-pub struct ScoringEngine {
-    weights: Vec<ScoringWeight>,
+/// Bayesian scorer that combines indicator probabilities with temporal decay
+/// and graph-based propagation. Formula:
+/// P = 1 - Π(1 - P_i * decay(t_i)) where each P_i is the base probability
+/// of an indicator and decay(t) = 2^(-age / half_life).
+pub struct BayesianScorer {
+    indicators: HashMap<String, IndicatorDef>,
+    half_life_secs: f64,
+    threshold_low: f64,
+    threshold_medium: f64,
+    threshold_high: f64,
 }
 
-struct ScoringWeight {
-    category: String,
-    weight: f64,
-    indicators: Vec<SuspicionIndicator>,
+struct IndicatorDef {
+    category: &'static str,
+    base_prob: f64,
+    description: &'static str,
 }
 
-struct SuspicionIndicator {
-    name: String,
-    score: f64,
-    description: String,
-}
-
-impl ScoringEngine {
-    pub fn new() -> Self {
+impl BayesianScorer {
+    pub fn new(half_life_secs: f64) -> Self {
+        let mut indicators = HashMap::new();
+        for ind in Self::default_indicators() {
+            indicators.insert(ind.0.to_string(), IndicatorDef {
+                category: ind.1,
+                base_prob: ind.2,
+                description: ind.3,
+            });
+        }
         Self {
-            weights: vec![
-                ScoringWeight {
-                    category: "unsigned_modules".into(),
-                    weight: 0.25,
-                    indicators: vec![
-                        SuspicionIndicator { name: "unsigned_dll".into(), score: 0.4, description: "Unsigned DLL loaded".into() },
-                        SuspicionIndicator { name: "unsigned_driver".into(), score: 0.6, description: "Unsigned driver loaded".into() },
-                    ],
-                },
-                ScoringWeight {
-                    category: "process_behavior".into(),
-                    weight: 0.20,
-                    indicators: vec![
-                        SuspicionIndicator { name: "hidden_process".into(), score: 0.8, description: "Hidden process detected".into() },
-                        SuspicionIndicator { name: "suspicious_parent".into(), score: 0.3, description: "Suspicious parent-child relationship".into() },
-                        SuspicionIndicator { name: "remote_thread".into(), score: 0.7, description: "Remote thread detected".into() },
-                    ],
-                },
-                ScoringWeight {
-                    category: "file_activity".into(),
-                    weight: 0.20,
-                    indicators: vec![
-                        SuspicionIndicator { name: "deleted_executable".into(), score: 0.5, description: "Executable deleted after execution".into() },
-                        SuspicionIndicator { name: "cleanup_script".into(), score: 0.6, description: "Cleanup script detected".into() },
-                        SuspicionIndicator { name: "timestamp_anomaly".into(), score: 0.3, description: "Timestamp modification detected".into() },
-                    ],
-                },
-                ScoringWeight {
-                    category: "emulator_integrity".into(),
-                    weight: 0.20,
-                    indicators: vec![
-                        SuspicionIndicator { name: "injected_dll".into(), score: 0.7, description: "DLL injected into emulator".into() },
-                        SuspicionIndicator { name: "suspicious_overlay".into(), score: 0.6, description: "Suspicious overlay detected".into() },
-                        SuspicionIndicator { name: "modified_emulator_file".into(), score: 0.5, description: "Emulator files modified".into() },
-                    ],
-                },
-                ScoringWeight {
-                    category: "memory_integrity".into(),
-                    weight: 0.15,
-                    indicators: vec![
-                        SuspicionIndicator { name: "suspicious_memory".into(), score: 0.5, description: "Suspicious memory permissions".into() },
-                        SuspicionIndicator { name: "injected_code".into(), score: 0.8, description: "Code injection detected".into() },
-                    ],
-                },
-                ScoringWeight {
-                    category: "detection_engine".into(),
-                    weight: 0.25,
-                    indicators: vec![
-                        SuspicionIndicator { name: "high_detection_risk".into(), score: 0.9, description: "High overall detection risk score".into() },
-                        SuspicionIndicator { name: "multiple_techniques_detected".into(), score: 0.7, description: "Multiple detection techniques triggered".into() },
-                        SuspicionIndicator { name: "high_bypass_risk".into(), score: 0.3, description: "Techniques with high bypass risk".into() },
-                    ],
-                },
-            ],
+            indicators,
+            half_life_secs,
+            threshold_low: 0.2,
+            threshold_medium: 0.45,
+            threshold_high: 0.75,
         }
     }
 
-    pub fn calculate_score(&self, active_indicators: &[String]) -> SuspicionScore {
-        let mut total_score = 0.0;
-        let mut categories = Vec::new();
+    fn default_indicators() -> Vec<(&'static str, &'static str, f64, &'static str)> {
+        vec![
+            ("unsigned_dll", "unsigned_modules", 0.35, "Unsigned DLL loaded"),
+            ("unsigned_driver", "unsigned_modules", 0.55, "Unsigned driver loaded"),
+            ("hidden_process", "process_behavior", 0.75, "Hidden process detected"),
+            ("suspicious_parent", "process_behavior", 0.25, "Suspicious parent-child relationship"),
+            ("remote_thread", "process_behavior", 0.65, "Remote thread detected"),
+            ("deleted_executable", "file_activity", 0.45, "Executable deleted after execution"),
+            ("cleanup_script", "file_activity", 0.55, "Cleanup script detected"),
+            ("timestamp_anomaly", "file_activity", 0.25, "Timestamp modification detected"),
+            ("injected_dll", "emulator_integrity", 0.65, "DLL injected into emulator"),
+            ("suspicious_overlay", "emulator_integrity", 0.55, "Suspicious overlay detected"),
+            ("modified_emulator_file", "emulator_integrity", 0.45, "Emulator files modified"),
+            ("suspicious_memory", "memory_integrity", 0.45, "Suspicious memory permissions"),
+            ("injected_code", "memory_integrity", 0.75, "Code injection detected"),
+            ("high_detection_risk", "detection_engine", 0.85, "High overall detection risk"),
+            ("multiple_techniques_detected", "detection_engine", 0.65, "Multiple detection techniques triggered"),
+            ("high_bypass_risk", "detection_engine", 0.25, "Techniques with high bypass risk"),
+        ]
+    }
+
+    /// Bayesian combination: P = 1 - Π(1 - P_i * decay)
+    /// where decay accounts for event age relative to half-life.
+    pub fn calculate_score(&self, active_indicators: &[(String, f64)]) -> SuspicionScore {
+        let mut combined_prob = 0.0;
+        let mut category_scores: HashMap<&str, Vec<f64>> = HashMap::new();
         let mut all_flags = Vec::new();
 
-        for weight in &self.weights {
-            let mut category_score = 0.0;
-            let mut category_indicators = Vec::new();
-            
-            for indicator in &weight.indicators {
-                if active_indicators.iter().any(|i| i == &indicator.name) {
-                    category_score += indicator.score;
-                    category_indicators.push(indicator.description.clone());
-                    all_flags.push(indicator.name.clone());
-                }
+        for (name, age_secs) in active_indicators {
+            if let Some(def) = self.indicators.get(name.as_str()) {
+                let decay = (-age_secs / self.half_life_secs).exp();
+                let adj_prob = def.base_prob * decay;
+                combined_prob = 1.0 - (1.0 - combined_prob) * (1.0 - adj_prob);
+                category_scores.entry(def.category)
+                    .or_default()
+                    .push(adj_prob);
+                all_flags.push(name.clone());
             }
+        }
 
-            category_score = (category_score / weight.indicators.len() as f64).clamp(0.0, 1.0);
-            total_score += category_score * weight.weight;
-
+        let mut categories = Vec::new();
+        for (&cat_name, probs) in &category_scores {
+            let mut cat_prob = 0.0;
+            for &p in probs {
+                cat_prob = 1.0 - (1.0 - cat_prob) * (1.0 - p);
+            }
             categories.push(SuspicionCategory {
-                name: weight.category.clone(),
-                score: category_score,
-                weight: weight.weight,
-                indicators: category_indicators,
+                name: cat_name.to_string(),
+                score: cat_prob,
+                weight: 1.0 / category_scores.len() as f64,
+                indicators: probs.iter().map(|p| format!("p={:.3}", p)).collect(),
             });
         }
 
-        total_score = total_score.clamp(0.0, 1.0);
-        
-        let risk_level = if total_score < 0.2 {
+        let risk_level = if combined_prob < self.threshold_low {
             "low"
-        } else if total_score < 0.5 {
+        } else if combined_prob < self.threshold_medium {
             "medium"
-        } else if total_score < 0.8 {
+        } else if combined_prob < self.threshold_high {
             "high"
         } else {
             "critical"
         };
 
         SuspicionScore {
-            overall_score: total_score,
+            overall_score: combined_prob.clamp(0.0, 1.0),
             categories,
             flags: all_flags,
             risk_level: risk_level.to_string(),
         }
+    }
+}
+
+/// Legacy ScoringEngine wrapper that delegates to BayesianScorer.
+pub struct ScoringEngine {
+    scorer: BayesianScorer,
+}
+
+impl ScoringEngine {
+    pub fn new() -> Self {
+        Self { scorer: BayesianScorer::new(3600.0) }
+    }
+
+    pub fn calculate_score(&self, active_indicators: &[String]) -> SuspicionScore {
+        let indicators: Vec<(String, f64)> = active_indicators.iter()
+            .map(|name| (name.clone(), 0.0))
+            .collect();
+        self.scorer.calculate_score(&indicators)
     }
 }

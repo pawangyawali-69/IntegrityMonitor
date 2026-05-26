@@ -147,36 +147,99 @@ pub fn parse_pe_file(path: &str) -> Option<PeInfo> {
 }
 
 /// Compare a module's in-memory PE headers against its on-disk version.
-/// Returns anomalies if memory differs from disk (process hollowing indicator).
-pub fn compare_memory_vs_disk(memory_base: *const u8, disk_path: &str) -> Vec<String> {
+/// Reads process memory via ReadProcessMemory. Returns anomalies if memory
+/// differs from disk (process hollowing indicator).
+extern "system" {
+    fn ReadProcessMemory(
+        hProcess: *mut std::ffi::c_void,
+        lpBaseAddress: *const std::ffi::c_void,
+        lpBuffer: *mut std::ffi::c_void,
+        nSize: usize,
+        lpNumberOfBytesRead: *mut usize,
+    ) -> i32;
+}
+
+pub fn compare_memory_vs_disk_pid(pid: u32, image_base: u64, disk_path: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+
     unsafe {
-        let mut findings = Vec::new();
-
-        // Read DOS header from memory
-        let mem_dos = memory_base as *const IMAGE_DOS_HEADER;
-        if (*mem_dos).e_magic != IMAGE_DOS_SIGNATURE {
-            findings.push("No valid DOS header in memory".into());
-            return findings;
-        }
-
-        // Read NT headers from memory
-        let nt_offset = (*mem_dos).e_lfanew as usize;
-        let mem_nt = memory_base.add(nt_offset) as *const IMAGE_NT_HEADERS;
-        if (*mem_nt).Signature != IMAGE_NT_SIGNATURE {
-            findings.push("No valid NT headers in memory".into());
-            return findings;
-        }
-
-        let disk_pe = match parse_pe_file(disk_path) {
-            Some(p) => p,
-            None => {
-                findings.push("Cannot parse disk image".into());
+        let handle = match windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(
+                windows::Win32::System::Threading::PROCESS_QUERY_INFORMATION.0
+                | windows::Win32::System::Threading::PROCESS_VM_READ.0
+            ),
+            false,
+            pid,
+        ) {
+            Ok(h) => h,
+            Err(_) => {
+                findings.push(format!("Cannot open PID {} for reading", pid));
                 return findings;
             }
         };
 
-        let mem_file_hdr = &(*mem_nt).FileHeader;
-        let mem_opt_hdr = &(*mem_nt).OptionalHeader;
+        // Read DOS header (64 bytes)
+        let mut dos_buf = [0u8; 64];
+        let mut bytes_read: usize = 0;
+        let read_result = ReadProcessMemory(
+            handle.0 as *mut std::ffi::c_void,
+            image_base as *const std::ffi::c_void,
+            dos_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            dos_buf.len(),
+            &mut bytes_read as *mut _,
+        );
+
+        if read_result == 0 || bytes_read < 64 {
+            findings.push("Cannot read DOS header from process memory".into());
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            return findings;
+        }
+
+        let dos = dos_buf.as_ptr() as *const IMAGE_DOS_HEADER;
+        if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
+            findings.push("No valid DOS header in process memory".into());
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            return findings;
+        }
+
+        let nt_offset = (*dos).e_lfanew as usize;
+
+        // Read NT headers
+        let nt_size = std::mem::size_of::<IMAGE_NT_HEADERS>();
+        let mut nt_buf = vec![0u8; nt_size];
+        let read_result = ReadProcessMemory(
+            handle.0 as *mut std::ffi::c_void,
+            (image_base + nt_offset as u64) as *const std::ffi::c_void,
+            nt_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            nt_buf.len(),
+            &mut bytes_read as *mut _,
+        );
+
+        if read_result == 0 || bytes_read < nt_size {
+            findings.push("Cannot read NT headers from process memory".into());
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            return findings;
+        }
+
+        let nt = nt_buf.as_ptr() as *const IMAGE_NT_HEADERS;
+        if (*nt).Signature != IMAGE_NT_SIGNATURE {
+            findings.push("No valid NT headers in process memory".into());
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            return findings;
+        }
+
+        // Read disk PE for comparison
+        let disk_pe = match parse_pe_file(disk_path) {
+            Some(p) => p,
+            None => {
+                findings.push("Cannot parse disk image".into());
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+                return findings;
+            }
+        };
+
+        let mem_file_hdr = &(*nt).FileHeader;
+        let mem_opt_hdr = &(*nt).OptionalHeader;
 
         // Compare entry points
         if mem_opt_hdr.AddressOfEntryPoint != disk_pe.entry_point {
@@ -194,25 +257,33 @@ pub fn compare_memory_vs_disk(memory_base: *const u8, disk_path: &str) -> Vec<St
             ));
         }
 
-        // Compare section characteristics
-        let mem_section_off = nt_offset + std::mem::size_of::<IMAGE_NT_HEADERS>();
+        // Read and compare section headers
         let sec_size = std::mem::size_of::<IMAGE_SECTION_HEADER>();
+        let mem_sections_off = nt_offset + std::mem::size_of::<IMAGE_NT_HEADERS>();
+        let num_sections = mem_file_hdr.NumberOfSections.min(disk_pe.num_sections) as usize;
 
-        for i in 0..mem_file_hdr.NumberOfSections.min(disk_pe.num_sections) as usize {
-            let mem_sec = memory_base.add(mem_section_off + i * sec_size) as *const IMAGE_SECTION_HEADER;
+        let mut sec_buf = vec![0u8; num_sections * sec_size];
+        let read_result = ReadProcessMemory(
+            handle.0 as *mut std::ffi::c_void,
+            (image_base + mem_sections_off as u64) as *const std::ffi::c_void,
+            sec_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            sec_buf.len(),
+            &mut bytes_read as *mut _,
+        );
 
-            // Compare section virtual sizes
-            if (*mem_sec).Misc.VirtualSize != disk_pe.sections[i].virtual_size {
-                findings.push(format!(
-                    "Section '{}' virtual size mismatch: mem=0x{:X} disk=0x{:X}",
-                    disk_pe.sections[i].name,
-                    (*mem_sec).Misc.VirtualSize,
-                    disk_pe.sections[i].virtual_size
-                ));
-            }
+        if read_result != 0 && bytes_read >= sec_size {
+            for i in 0..num_sections {
+                let mem_sec = sec_buf.as_ptr().add(i * sec_size) as *const IMAGE_SECTION_HEADER;
 
-            // Compare section characteristics (RWX flags)
-            if (*mem_sec).Characteristics != disk_pe.sections[i].characteristics {
+                if (*mem_sec).Misc.VirtualSize != disk_pe.sections[i].virtual_size {
+                    findings.push(format!(
+                        "Section '{}' virtual size mismatch: mem=0x{:X} disk=0x{:X}",
+                        disk_pe.sections[i].name,
+                        (*mem_sec).Misc.VirtualSize,
+                        disk_pe.sections[i].virtual_size
+                    ));
+                }
+
                 let mem_char = (*mem_sec).Characteristics;
                 let disk_char = disk_pe.sections[i].characteristics;
                 if (mem_char & IMAGE_SCN_MEM_EXECUTE) != (disk_char & IMAGE_SCN_MEM_EXECUTE) {
@@ -224,8 +295,10 @@ pub fn compare_memory_vs_disk(memory_base: *const u8, disk_path: &str) -> Vec<St
             }
         }
 
-        findings
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
+
+    findings
 }
 
 fn compute_entropy(data: &[u8], offset: usize, size: usize) -> f64 {

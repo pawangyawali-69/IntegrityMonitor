@@ -158,7 +158,8 @@ fn start_etw_trace() {
         (*props).MaximumBuffers = 64;
         (*props).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        (*props).EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD;
+        (*props).EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD | EVENT_TRACE_FLAG_IMAGE_LOAD
+            | EVENT_TRACE_FLAG(0x00000020) /*REGISTRY*/ | EVENT_TRACE_FLAG(0x00100000) /*NETWORK_TCPIP*/;
 
         let mut trace_handle: CONTROLTRACE_HANDLE = std::mem::zeroed();
         let status = StartTraceW(
@@ -210,6 +211,7 @@ unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD)
         EVENT_PROCESS_CREATE => handle_process_create(pid, user_data, user_len),
         EVENT_PROCESS_END => handle_process_end(pid),
         EVENT_THREAD_CREATE => handle_thread_create(pid, tid, user_data, user_len),
+        EVENT_THREAD_END => {},
         EVENT_IMAGE_LOAD => handle_image_load(pid, user_data, user_len),
         _ => {}
     }
@@ -256,7 +258,7 @@ fn handle_process_create(pid: u32, data: *const u8, len: usize) {
                 parent_pid: parent_id,
                 name: name.clone(),
                 path: name.clone(),
-                command_line: cmd,
+                command_line: cmd.clone(),
                 session_id,
                 user_sid: None,
                 start_time: timestamp.clone(),
@@ -275,8 +277,8 @@ fn handle_process_create(pid: u32, data: *const u8, len: usize) {
                 pid: process_id,
                 parent_pid: parent_id,
                 name: name.clone(),
-                path: name,
-                command_line: String::new(),
+                path: name.clone(),
+                command_line: cmd.clone(),
                 session_id,
                 timestamp,
                 user_sid: None,
@@ -348,10 +350,15 @@ fn handle_image_load(pid: u32, data: *const u8, len: usize) {
         submit_trust_verification(pid, &image_path, image_base, image_size);
 
         // Emit lightweight event immediately (trust verification is deferred)
+        let proc_name = ETW_PROC_TABLE.get()
+            .and_then(|t| t.get(&pid))
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
         if let Some(bus) = ETW_BUS.get() {
             bus.emit(TelemetryEvent::ImageLoaded {
                 pid,
-                process_name: String::new(),
+                process_name: proc_name,
                 image_path,
                 image_base,
                 image_size,

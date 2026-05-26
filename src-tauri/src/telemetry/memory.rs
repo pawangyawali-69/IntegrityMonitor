@@ -569,3 +569,110 @@ pub fn detect_pe_in_memory(pid: u32) -> Vec<MemoryRegion> {
         .filter(|r| r.has_pe_header && r.state == "committed")
         .collect()
 }
+
+#[derive(Debug, Clone)]
+pub struct MemorySnapshot {
+    pub pid: u32,
+    pub regions: Vec<MemoryRegion>,
+    pub scanned_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryDelta {
+    pub pid: u32,
+    pub process_name: String,
+    pub base_address: u64,
+    pub size: usize,
+    pub change_type: String,
+    pub old_protect: String,
+    pub new_protect: String,
+    pub timestamp: String,
+}
+
+/// Tracks per-process memory region state across scans and emits deltas.
+pub struct ProcessMemoryTracker {
+    snapshots: std::collections::HashMap<u32, MemorySnapshot>,
+}
+
+impl ProcessMemoryTracker {
+    pub fn new() -> Self {
+        Self {
+            snapshots: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Scan a process and return any memory deltas (new/removed/changed regions).
+    pub fn scan_process(&mut self, pid: u32, process_name: &str) -> Vec<MemoryDelta> {
+        let regions = enumerate_memory_regions(pid);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut deltas = Vec::new();
+
+        if let Some(prev) = self.snapshots.get(&pid) {
+            let prev_map: std::collections::HashMap<u64, &MemoryRegion> = prev.regions.iter()
+                .map(|r| (r.base_address, r))
+                .collect();
+            let cur_map: std::collections::HashMap<u64, &MemoryRegion> = regions.iter()
+                .map(|r| (r.base_address, r))
+                .collect();
+
+            for region in &regions {
+                match prev_map.get(&region.base_address) {
+                    None => {
+                        deltas.push(MemoryDelta {
+                            pid, process_name: process_name.into(),
+                            base_address: region.base_address, size: region.size,
+                            change_type: "region_created".into(),
+                            old_protect: String::new(),
+                            new_protect: region.protect.clone(),
+                            timestamp: now.clone(),
+                        });
+                    }
+                    Some(prev_r) => {
+                        if prev_r.protect != region.protect {
+                            deltas.push(MemoryDelta {
+                                pid, process_name: process_name.into(),
+                                base_address: region.base_address, size: region.size,
+                                change_type: "protection_changed".into(),
+                                old_protect: prev_r.protect.clone(),
+                                new_protect: region.protect.clone(),
+                                timestamp: now.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            for (addr, prev_r) in &prev_map {
+                if !cur_map.contains_key(addr) {
+                    deltas.push(MemoryDelta {
+                        pid, process_name: process_name.into(),
+                        base_address: *addr, size: prev_r.size,
+                        change_type: "region_deleted".into(),
+                        old_protect: prev_r.protect.clone(),
+                        new_protect: String::new(),
+                        timestamp: now.clone(),
+                    });
+                }
+            }
+        }
+
+        self.snapshots.insert(pid, MemorySnapshot {
+            pid,
+            regions,
+            scanned_at: now,
+        });
+
+        deltas
+    }
+
+    /// Check if a protection transition is suspicious (e.g., RW -> RX).
+    pub fn is_suspicious_transition(old_protect: &str, new_protect: &str) -> bool {
+        let old_w = old_protect.contains("W") || old_protect.contains("RW");
+        let new_x = new_protect.contains("EX") || new_protect == "EX";
+        old_w && new_x
+    }
+
+    pub fn clear(&mut self) {
+        self.snapshots.clear();
+    }
+}

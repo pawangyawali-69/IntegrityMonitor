@@ -8,38 +8,45 @@ pub mod memory;
 pub mod network;
 pub mod anti_cheat;
 pub mod yara;
+pub mod envelope;
+pub mod normalize;
+pub mod router;
+pub mod stream;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::broadcast;
+use std::sync::Mutex;
 use dashmap::DashMap;
+
+enum BackpressurePolicy {
+    DropOldest,
+    DropNewest,
+    Block,
+}
+
+struct Subscriber {
+    sender: crossbeam::channel::Sender<TelemetryEvent>,
+    policy: BackpressurePolicy,
+}
 
 #[derive(Clone)]
 pub struct EventBus {
-    tx: broadcast::Sender<TelemetryEvent>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
     journal_tx: Option<crossbeam::channel::Sender<TelemetryEvent>>,
     emit_count: Arc<AtomicU64>,
 }
 
 impl EventBus {
-    pub fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
+    pub fn new() -> Self {
         Self {
-            tx,
+            subscribers: Arc::new(Mutex::new(Vec::new())),
             journal_tx: None,
             emit_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn with_journal(
-        tx: broadcast::Sender<TelemetryEvent>,
-        journal_tx: crossbeam::channel::Sender<TelemetryEvent>,
-    ) -> Self {
-        Self {
-            tx,
-            journal_tx: Some(journal_tx),
-            emit_count: Arc::new(AtomicU64::new(0)),
-        }
+    pub fn set_journal(&mut self, tx: crossbeam::channel::Sender<TelemetryEvent>) {
+        self.journal_tx = Some(tx);
     }
 
     pub fn emit(&self, event: TelemetryEvent) {
@@ -47,17 +54,46 @@ impl EventBus {
         if let Some(ref jtx) = self.journal_tx {
             let _ = jtx.try_send(event.clone());
         }
-        let _ = self.tx.send(event);
+        let subs = self.subscribers.lock().unwrap();
+        for sub in subs.iter() {
+            match sub.policy {
+                BackpressurePolicy::DropOldest => {
+                    let _ = sub.sender.try_send(event.clone());
+                }
+                BackpressurePolicy::DropNewest => {
+                    if sub.sender.is_full() {
+                        // skip — drop newest
+                    } else {
+                        let _ = sub.sender.try_send(event.clone());
+                    }
+                }
+                BackpressurePolicy::Block => {
+                    let _ = sub.sender.send(event.clone());
+                }
+            }
+        }
     }
 
     /// Emit without journaling (used for replay and internal system events)
     pub fn broadcast(&self, event: TelemetryEvent) {
         self.emit_count.fetch_add(1, Ordering::Relaxed);
-        let _ = self.tx.send(event);
+        let subs = self.subscribers.lock().unwrap();
+        for sub in subs.iter() {
+            let _ = sub.sender.try_send(event.clone());
+        }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
-        self.tx.subscribe()
+    pub fn subscribe(&self) -> crossbeam::channel::Receiver<TelemetryEvent> {
+        self.subscribe_with_capacity(4096)
+    }
+
+    pub fn subscribe_with_capacity(&self, capacity: usize) -> crossbeam::channel::Receiver<TelemetryEvent> {
+        let (tx, rx) = crossbeam::channel::bounded(capacity);
+        self.subscribers.lock().unwrap().push(Subscriber {
+            sender: tx,
+            policy: BackpressurePolicy::DropOldest,
+        });
+        rx
     }
 
     pub fn emit_count(&self) -> u64 {
@@ -144,6 +180,16 @@ pub enum TelemetryEvent {
         details: String,
         timestamp: String,
     },
+    MemoryChanged {
+        pid: u32,
+        process_name: String,
+        base_address: u64,
+        size: usize,
+        old_protect: String,
+        new_protect: String,
+        change_type: String,
+        timestamp: String,
+    },
     SystemHealth {
         uptime_secs: u64,
         etw_events_processed: u64,
@@ -200,9 +246,9 @@ pub struct ThreadState {
 }
 
 pub fn initialize_platform() -> (EventBus, ProcessTable) {
-    let (tx, _) = broadcast::channel(4096);
     let (jtx, jrx) = crossbeam::channel::unbounded();
-    let bus = EventBus::with_journal(tx, jtx);
+    let mut bus = EventBus::new();
+    bus.set_journal(jtx);
     let proc_table: ProcessTable = Arc::new(DashMap::new());
 
     // Start journal worker (persists all events to SQLite)

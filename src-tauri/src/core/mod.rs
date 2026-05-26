@@ -13,6 +13,7 @@ pub mod handle_inspector;
 pub mod string_extractor;
 pub mod injection_detector;
 pub mod rootkit_detector;
+pub mod lifecycle;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize};
@@ -20,7 +21,9 @@ use std::time::Duration;
 use tauri::Emitter;
 
 use crate::telemetry::{EventBus, ProcessTable, correlation::CorrelationActor,
-    anti_cheat::AntiCheatMonitor, network::NetworkTable, yara::YaraScanner};
+    anti_cheat::AntiCheatMonitor, network::NetworkTable, yara::YaraScanner,
+    memory::ProcessMemoryTracker};
+use crate::kernel::telemetry::KernelTelemetryService;
 use crate::detection_rules::{DetectionEngine, AnomalyTracker};
 
 pub struct CoreState {
@@ -43,10 +46,12 @@ pub struct CoreState {
     pub emulator_monitor: emulator_monitor::EmulatorMonitor,
     pub artifact_parser: artifact_parsers::ArtifactParserManager,
     pub kernel_driver: crate::kernel::KernelDriver,
+    pub kernel_telemetry: KernelTelemetryService,
     pub anti_cheat_monitor: AntiCheatMonitor,
     pub yara_scanner: YaraScanner,
     pub detection_engine: DetectionEngine,
     pub anomaly_tracker: AnomalyTracker,
+    pub memory_tracker: ProcessMemoryTracker,
     pub memory_regions_total: AtomicUsize,
 }
 
@@ -74,6 +79,7 @@ impl CoreState {
             Err(e) => {
                 log::error!("DB init failed: {}", e);
                 let ebus = event_bus.clone();
+                let kbus = event_bus.clone();
                 let ptable = proc_table.clone();
                 return Self {
                     monitoring_active: true,
@@ -92,10 +98,12 @@ impl CoreState {
                     emulator_monitor: emulator_monitor::EmulatorMonitor::new(),
                     artifact_parser: artifact_parsers::ArtifactParserManager::new(),
                     kernel_driver: crate::kernel::KernelDriver::new(),
+                    kernel_telemetry: KernelTelemetryService::new(kbus),
                     anti_cheat_monitor: AntiCheatMonitor::new(),
                     yara_scanner: YaraScanner::new(),
                     detection_engine: DetectionEngine::new(crate::telemetry::ProcessTable::default()),
                     anomaly_tracker: AnomalyTracker::new(3600),
+                    memory_tracker: ProcessMemoryTracker::new(),
                     memory_regions_total: AtomicUsize::new(0),
                 };
             }
@@ -113,17 +121,19 @@ impl CoreState {
             file_monitor: file_monitor::FileMonitor::new(),
             dll_analyzer: dll_analyzer::DllAnalyzer::new(),
             correlation_engine: correlation_engine::CorrelationEngine::new(),
-            correlation_actor: CorrelationActor::new(event_bus, proc_table.clone()),
+            correlation_actor: CorrelationActor::new(event_bus.clone(), proc_table.clone()),
             timeline: timeline::TimelineEngine::new(),
             scoring_engine: scoring::ScoringEngine::new(),
             search_engine: search_engine::SearchEngine::new(),
             emulator_monitor: emulator_monitor::EmulatorMonitor::new(),
             artifact_parser: artifact_parsers::ArtifactParserManager::new(),
             kernel_driver: crate::kernel::KernelDriver::new(),
+            kernel_telemetry: KernelTelemetryService::new(event_bus),
             anti_cheat_monitor: AntiCheatMonitor::new(),
             yara_scanner: YaraScanner::new(),
             detection_engine: DetectionEngine::new(proc_table),
             anomaly_tracker: AnomalyTracker::new(3600),
+            memory_tracker: ProcessMemoryTracker::new(),
             memory_regions_total: AtomicUsize::new(0),
         }
     }
@@ -314,6 +324,8 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
             let ev_count: usize;
             let ac_detections: usize;
             let correlation_count: usize;
+            let suspicion_score: f64;
+            let risk_level: String;
 
             {
                 let mut s = state.write();
@@ -350,6 +362,10 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
                 let detection_summary = s.detection_engine.evaluate_all(&processes);
                 s.anomaly_tracker.record(detection_summary.overall_risk_score);
 
+                let bayesian_score = s.scoring_engine.calculate_score(&detection_summary.detection_indicators());
+                suspicion_score = bayesian_score.overall_score;
+                risk_level = bayesian_score.risk_level;
+
                 // Injection detection
                 let injections = crate::core::injection_detector::detect_injections(&processes);
                 for inj in &injections {
@@ -385,6 +401,66 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
                                 process_name: None, pid: None, path: None,
                                 details: serde_json::json!(rk),
                             });
+                        }
+                    }
+                }
+
+                // Memory delta tracking (every tick for sensitive processes, every 5 ticks for others)
+                for p in &processes {
+                    if tick % 5 == 0 || p.is_suspicious {
+                        let deltas = s.memory_tracker.scan_process(p.pid, &p.name);
+                        for d in &deltas {
+                            let is_suspicious = ProcessMemoryTracker::is_suspicious_transition(&d.old_protect, &d.new_protect);
+                            if is_suspicious || d.change_type == "region_created" {
+                                s.event_bus.emit(crate::telemetry::TelemetryEvent::MemoryChanged {
+                                    pid: d.pid,
+                                    process_name: d.process_name.clone(),
+                                    base_address: d.base_address,
+                                    size: d.size,
+                                    old_protect: d.old_protect.clone(),
+                                    new_protect: d.new_protect.clone(),
+                                    change_type: d.change_type.clone(),
+                                    timestamp: ts.clone(),
+                                });
+                                if is_suspicious {
+                                    s.timeline.add_event(TimelineEvent {
+                                        id: uuid::Uuid::new_v4().to_string(), timestamp: ts.clone(),
+                                        event_type: "memory_delta".into(), category: "detection".into(),
+                                        description: format!("Suspicious memory transition: {} -> {} at 0x{:X} in {}",
+                                            d.old_protect, d.new_protect, d.base_address, d.process_name),
+                                        severity: "high".into(), source: "memory_tracker".into(),
+                                        process_name: Some(d.process_name.clone()), pid: Some(d.pid), path: None,
+                                        details: serde_json::json!(d),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // PE comparison: check in-memory headers vs disk for critical processes (every 10 ticks)
+                if tick % 10 == 0 {
+                    for p in &processes {
+                        if p.pid == 4 || p.name.to_lowercase() == "lsass.exe" || p.is_suspicious {
+                            if let Some(module) = p.modules.first() {
+                                let base = u64::from_str_radix(&module.base_address.trim_start_matches("0x"), 16).unwrap_or(0);
+                                if base > 0 {
+                                    let anomalies = crate::telemetry::pe::compare_memory_vs_disk_pid(
+                                        p.pid, base, &module.path,
+                                    );
+                                    if !anomalies.is_empty() {
+                                        s.event_bus.emit(crate::telemetry::TelemetryEvent::SuspiciousActivity {
+                                            rule_name: "pe_header_mismatch".into(),
+                                            severity: "CRITICAL".into(),
+                                            description: format!("PE header mismatch in {}: {}", p.name, anomalies.join("; ")),
+                                            pid: p.pid,
+                                            process_name: p.name.clone(),
+                                            evidence: anomalies,
+                                            timestamp: ts.clone(),
+                                        });
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -535,6 +611,8 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
                     system_health: if total == 0 { "initializing".into() } else { "healthy".into() },
                     cpu_usage: processes.iter().map(|p| p.cpu_usage).sum(),
                     memory_usage: processes.iter().map(|p| p.memory_usage).sum::<u64>() as f64,
+                    suspicion_score,
+                    risk_level,
                 });
 
                 let emus = if state.read().is_admin {
@@ -547,6 +625,8 @@ pub fn start_background_monitoring(state: Arc<parking_lot::RwLock<CoreState>>, a
                 let mut kd = state.read().kernel_driver.clone();
                 kd.refresh();
                 let _ = app_handle.emit("kernel-status", &kd);
+
+                state.read().kernel_telemetry.poll_and_emit();
             }
 
             tick += 1;
@@ -568,4 +648,6 @@ pub struct DashboardMetrics {
     pub system_health: String,
     pub cpu_usage: f64,
     pub memory_usage: f64,
+    pub suspicion_score: f64,
+    pub risk_level: String,
 }

@@ -59,7 +59,7 @@ pub struct AnomalyTracker {
     window: VecDeque<(chrono::DateTime<chrono::Utc>, f64)>,
     window_seconds: i64,
     baseline_mean: f64,
-    baseline_std: f64,
+    baseline_m2: f64,
     samples: usize,
 }
 
@@ -69,7 +69,7 @@ impl AnomalyTracker {
             window: VecDeque::with_capacity(4096),
             window_seconds,
             baseline_mean: 0.0,
-            baseline_std: 1.0,
+            baseline_m2: 0.0,
             samples: 0,
         }
     }
@@ -88,10 +88,10 @@ impl AnomalyTracker {
             self.samples += 1;
             let n = self.samples as f64;
             let old_mean = self.baseline_mean;
-            self.baseline_mean = old_mean + (score - old_mean) / n;
+            let delta = score - old_mean;
+            self.baseline_mean = old_mean + delta / n;
             if self.samples > 1 {
-                let old_std = self.baseline_std;
-                self.baseline_std = old_std + ((score - old_mean) * (score - self.baseline_mean) - old_std) / n;
+                self.baseline_m2 += delta * (score - self.baseline_mean);
             }
         }
     }
@@ -104,16 +104,18 @@ impl AnomalyTracker {
             return false;
         }
         let recent_avg: f64 = self.window.iter().map(|(_, s)| s).sum::<f64>() / self.window.len() as f64;
-        let threshold = self.baseline_mean + 3.0 * self.baseline_std.sqrt();
+        let std = self.baseline_m2.sqrt() / (self.samples as f64).sqrt();
+        let threshold = self.baseline_mean + 3.0 * std;
         recent_avg > threshold
     }
 
     pub fn z_score(&self) -> f64 {
-        if self.samples < 2 || self.baseline_std.sqrt() < 0.001 {
+        let std = self.baseline_m2.sqrt() / (self.samples as f64).sqrt();
+        if self.samples < 2 || std < 0.001 {
             return 0.0;
         }
         let recent_avg: f64 = self.window.iter().map(|(_, s)| s).sum::<f64>() / self.window.len().max(1) as f64;
-        (recent_avg - self.baseline_mean) / self.baseline_std.sqrt()
+        (recent_avg - self.baseline_mean) / std
     }
 }
 

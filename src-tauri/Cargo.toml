@@ -47,6 +47,7 @@ windows = { version = "0.54", features = [
 ] }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+smallvec = { version = "1", features = ["serde"] }
 log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
@@ -59,7 +60,7 @@ crossbeam = "0.8"
 crc32fast = "1.4"
 once_cell = "1.19"
 blake3 = "1.5"
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
 
 [features]
 default = ["custom-protocol"]

@@ -1,7 +1,9 @@
 import { lazy, Suspense, useEffect } from "react";
 import { useAtom } from "jotai";
+import { listen } from "@tauri-apps/api/event";
 import { AppShell } from "./components/AppShell";
 import { activeViewAtom, commandPaletteOpenAtom } from "./stores/ui-atoms";
+import { telemetryEnvelopesAtom } from "./stores/telemetry-atoms";
 import "./styles/globals.css";
 
 const Dashboard = lazy(() => import("./components/panels/Dashboard"));
@@ -67,6 +69,7 @@ function ViewRouter({ view }: { view: string }) {
 function App() {
   const [activeView] = useAtom(activeViewAtom);
   const [paletteOpen, setPaletteOpen] = useAtom(commandPaletteOpenAtom);
+  const [, setEnvelopes] = useAtom(telemetryEnvelopesAtom);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -82,6 +85,21 @@ function App() {
   useEffect(() => {
     document.documentElement.classList.add("dark");
   }, []);
+
+  // Subscribe to unified telemetry stream — updates ring buffer atom
+  useEffect(() => {
+    const unlisten = listen<unknown>("telemetry-batch", (event) => {
+      setEnvelopes((prev) => {
+        const batch = Array.isArray(event.payload) ? event.payload as any[] : [];
+        if (batch.length === 0) return prev;
+        const updated = [...prev, ...batch];
+        if (updated.length > 10_000) updated.splice(0, updated.length - 10_000);
+        return updated;
+      });
+    });
+
+    return () => { unlisten.then((f) => f()); };
+  }, [setEnvelopes]);
 
   return (
     <AppShell>

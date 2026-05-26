@@ -1,3 +1,5 @@
+pub mod telemetry;
+
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;

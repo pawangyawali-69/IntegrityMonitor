@@ -26,11 +26,14 @@ export default function Dashboard() {
       if (d) {
         setMetrics((prev) => ({
           ...prev,
-          totalProcesses: (d.total_processes as number) ?? prev.totalProcesses,
-          cpuUsage: (d.cpu_usage as number) ?? prev.cpuUsage,
-          memoryUsage: (d.memory_usage as number) ?? prev.memoryUsage,
-          suspiciousProcesses: (d.suspicious_count as number) ?? prev.suspiciousProcesses,
-          criticalDetections: (d.critical_count as number) ?? prev.criticalDetections,
+          totalProcesses: (d.totalProcesses as number) ?? prev.totalProcesses,
+          cpuUsage: (d.cpuUsage as number) ?? prev.cpuUsage,
+          memoryUsage: (d.memoryUsage as number) ?? prev.memoryUsage,
+          suspiciousProcesses: (d.suspiciousProcesses as number) ?? prev.suspiciousProcesses,
+          criticalDetections: (d.integrityAlerts as number) ?? prev.criticalDetections,
+          activeAttackChains: (d.correlationChains as number) ?? prev.activeAttackChains,
+          suspicionScore: (d.suspicionScore as number) ?? prev.suspicionScore,
+          riskLevel: (d.riskLevel as string) ?? prev.riskLevel,
         }));
       }
     });
@@ -40,6 +43,10 @@ export default function Dashboard() {
   const criticalAlerts = alerts.filter((a) => a.severity === "critical");
   const highAlerts = alerts.filter((a) => a.severity === "high");
 
+  const riskColor = metrics.riskLevel === "critical" ? "text-red-400" :
+    metrics.riskLevel === "high" ? "text-orange-400" :
+    metrics.riskLevel === "medium" ? "text-yellow-400" : "text-green-400";
+
   const statCards = [
     { label: "Processes", value: metrics.totalProcesses.toLocaleString(), icon: Activity, color: "text-blue-400" },
     { label: "CPU", value: `${metrics.cpuUsage.toFixed(1)}%`, icon: Cpu, color: "text-green-400" },
@@ -47,8 +54,8 @@ export default function Dashboard() {
     { label: "Suspicious", value: metrics.suspiciousProcesses.toString(), icon: AlertTriangle, color: metrics.suspiciousProcesses > 0 ? "text-red-400" : "text-green-400" },
     { label: "Detections", value: metrics.criticalDetections.toString(), icon: ShieldAlert, color: metrics.criticalDetections > 0 ? "text-red-400" : "text-muted-foreground" },
     { label: "Attack Chains", value: metrics.activeAttackChains.toString(), icon: Bug, color: metrics.activeAttackChains > 0 ? "text-orange-400" : "text-muted-foreground" },
-    { label: "Network", value: "Active", icon: Wifi, color: "text-cyan-400" },
-    { label: "Driver", value: metrics.kernelDriverRunning ? "Loaded" : "Unloaded", icon: Shield, color: metrics.kernelDriverRunning ? "text-green-400" : "text-yellow-400" },
+    { label: "Risk Score", value: `${(metrics.suspicionScore * 100).toFixed(0)}%`, icon: Shield, color: riskColor },
+    { label: "Driver", value: metrics.kernelDriverRunning ? "Loaded" : "Unloaded", icon: Wifi, color: metrics.kernelDriverRunning ? "text-green-400" : "text-yellow-400" },
   ];
 
   const recentActivity = [

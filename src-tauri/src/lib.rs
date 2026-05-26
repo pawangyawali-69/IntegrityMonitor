@@ -47,9 +47,19 @@ pub fn run() {
             ));
             crate::core::start_background_monitoring(state, app_handle);
 
+            // Initialize unified TelemetryRouter for frontend streaming
+            let telemetry_router = telemetry::router::TelemetryRouter::new();
+
+            // Start frontend streamer (batched TelemetryEnvelope → Tauri events)
+            let _fe_stream = telemetry::stream::spawn_frontend_streamer(
+                telemetry_router.clone(),
+                app.handle().clone(),
+            );
+
             app.manage(Arc::new(bus));
             app.manage(proc_table);
             app.manage(Arc::new(db_reader));
+            app.manage(Arc::new(telemetry_router));
 
             log::info!("IntegrityMonitor platform initialized");
             Ok(())
@@ -82,6 +92,7 @@ pub fn run() {
             api::commands::get_all_network_connections,
             api::commands::get_injection_indicators,
             api::commands::get_process_tree,
+            api::commands::subscribe_telemetry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running IntegrityMonitor");
