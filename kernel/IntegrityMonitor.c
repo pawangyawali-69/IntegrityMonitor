@@ -556,7 +556,32 @@ BOOLEAN IsCallerTrusted() {
         return FALSE;
     }
     HANDLE pid = PsGetProcessId(currentProcess);
-    return (pid != NULL && HandleToULong(pid) == 4) ? TRUE : FALSE;
+    if (pid == NULL) {
+        return FALSE;
+    }
+    ULONG ulPid = HandleToULong(pid);
+
+    // Allow SYSTEM (PID 4) and our user-mode agent
+    if (ulPid == 4) {
+        return TRUE;
+    }
+
+    // Allow IntegrityMonitor user-mode process
+    PUNICODE_STRING imageName = PsGetProcessImageFileName(currentProcess);
+    if (imageName != NULL && imageName->Buffer != NULL) {
+        WCHAR imageUpper[64];
+        ULONG copyLen = min(imageName->Length, sizeof(imageUpper) - sizeof(WCHAR));
+        RtlZeroMemory(imageUpper, sizeof(imageUpper));
+        RtlCopyMemory(imageUpper, imageName->Buffer, copyLen);
+        _wcsupr(imageUpper);
+
+        if (wcsstr(imageUpper, L"INTEGRITYMONITOR") != NULL ||
+            wcsstr(imageUpper, L"INTEGRITY-MONITOR") != NULL) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 VOID ClearEvents() {
@@ -650,11 +675,28 @@ VOID ThreadNotifyRoutine(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create) {
     ULONG pid = HandleToULong(ProcessId);
     ULONG tid = HandleToULong(ThreadId);
 
-    wchar_t nameBuf[64];
-    RtlStringCbPrintfW(nameBuf, sizeof(nameBuf), L"TID:%lu", tid);
+    wchar_t nameBuf[128];
+    if (Create) {
+        // Capture thread start address
+        ULONG_PTR startAddress = 0;
+        PETHREAD thread = NULL;
+        NTSTATUS status = PsLookupThreadByThreadId(ThreadId, &thread);
+        if (NT_SUCCESS(status) && thread != NULL) {
+            startAddress = PsGetThreadStartAddress(thread);
+            ObDereferenceObject(thread);
+        }
 
-    AddEventToList(Create ? EVENT_THREAD_CREATED : EVENT_PROCESS_TERMINATED,
-        pid, nameBuf, NULL, tid, 0, FALSE);
+        RtlStringCbPrintfW(nameBuf, sizeof(nameBuf),
+            L"TID:%lu,Start:0x%IX", tid, startAddress);
+
+        AddEventToList(EVENT_THREAD_CREATED,
+            pid, nameBuf,
+            NULL, (ULONG)startAddress, tid, FALSE);
+    } else {
+        RtlStringCbPrintfW(nameBuf, sizeof(nameBuf), L"TID:%lu", tid);
+        AddEventToList(EVENT_PROCESS_TERMINATED,
+            pid, nameBuf, NULL, tid, 0, FALSE);
+    }
 }
 
 VOID ImageLoadNotifyRoutine(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo) {
@@ -678,7 +720,37 @@ VOID ImageLoadNotifyRoutine(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIM
 OB_PREOP_CALLBACK_STATUS HandlePreOperationCallback(PVOID RegistrationContext,
     POB_PRE_OPERATION_INFORMATION OperationInformation) {
     UNREFERENCED_PARAMETER(RegistrationContext);
-    UNREFERENCED_PARAMETER(OperationInformation);
+    if (OperationInformation == NULL || OperationInformation->ObjectType != *PsProcessType) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    ACCESS_MASK desiredAccess = OperationInformation->Parameters->CreateHandleInformation.DesiredAccess;
+    PEPROCESS callerProcess = IoGetCurrentProcess();
+    HANDLE callerPid = PsGetProcessId(callerProcess);
+    HANDLE targetPid = PsGetProcessId((PEPROCESS)OperationInformation->Object);
+
+    // Log handle opens with suspicious access masks (cross-process with VM/CREATE_THREAD rights)
+    if ((ULONG_PTR)targetPid != (ULONG_PTR)callerPid) {
+        if (desiredAccess & (PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+            PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME | PROCESS_SET_INFORMATION)) {
+            WCHAR callerName[64] = { 0 };
+            PUNICODE_STRING callerImage = PsGetProcessImageFileName(callerProcess);
+            if (callerImage != NULL && callerImage->Buffer != NULL) {
+                RtlStringCbCopyNW(callerName, sizeof(callerName),
+                    callerImage->Buffer, min(callerImage->Length, sizeof(callerName) - sizeof(WCHAR)));
+            } else {
+                RtlStringCbPrintfW(callerName, sizeof(callerName), L"PID:%lu", HandleToULong(callerPid));
+            }
+
+            AddEventToList(EVENT_HANDLE_OPEN,
+                HandleToULong(callerPid), callerName,
+                NULL,
+                HandleToULong(targetPid),
+                (ULONG)desiredAccess,
+                TRUE);
+        }
+    }
+
     return OB_PREOP_SUCCESS;
 }
 

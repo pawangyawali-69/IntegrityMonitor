@@ -9,7 +9,10 @@ pub mod network;
 pub mod anti_cheat;
 pub mod yara;
 pub mod envelope;
+pub mod fabric;
+pub mod graph_intelligence;
 pub mod normalize;
+pub mod pipeline;
 pub mod router;
 pub mod stream;
 

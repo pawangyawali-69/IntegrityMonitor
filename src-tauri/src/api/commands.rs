@@ -6,6 +6,9 @@ use crate::telemetry::trust;
 use crate::telemetry::pe;
 use crate::telemetry::envelope::{CategoryFilter, Severity, FrontendSubscription};
 use crate::telemetry::router::TelemetryRouter;
+use crate::telemetry::graph_intelligence::GraphIntelligenceLayer;
+use crate::investigation::InvestigationEngine;
+use crate::investigation::session::SessionManager;
 
 #[tauri::command]
 pub fn get_process_list(proc_table: State<'_, ProcessTable>) -> Vec<serde_json::Value> {
@@ -387,4 +390,89 @@ pub fn subscribe_telemetry(
         "severity": min_severity,
         "subscriber_count": router.subscriber_count(),
     })
+}
+
+// ─── Investigation API ────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn create_investigation(
+    engine: State<'_, Arc<InvestigationEngine>>,
+    entity_id: String,
+    entity_kind: String,
+    label: String,
+) -> serde_json::Value {
+    let event = crate::telemetry::fabric::CanonicalTelemetryEvent {
+        event_id: uuid::Uuid::new_v4(),
+        correlation_id: None,
+        timestamp_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        timestamp_rfc3339: chrono::Utc::now().to_rfc3339(),
+        source: crate::telemetry::envelope::TelemetrySource::DetectionEngine,
+        category: crate::telemetry::envelope::TelemetryCategory::Detection,
+        severity: crate::telemetry::envelope::Severity::Medium,
+        entity: crate::telemetry::fabric::EntityRef {
+            entity_type: entity_kind,
+            entity_id,
+            label,
+        },
+        process_lineage: crate::telemetry::fabric::ProcessLineage {
+            pid: 0, parent_pid: 0, process_name: String::new(),
+            process_path: None, session_id: 0, user_sid: None,
+        },
+        payload: crate::telemetry::envelope::TelemetryPayload::SuspiciousActivity {
+            rule_name: "manual_investigation".into(),
+            description: "Manually created investigation".into(),
+            evidence: Vec::new(),
+        },
+        graph: None, detection: None, forensic: None,
+        trust_score: 0.5, risk_score: 0.0,
+        tags: vec!["manual".into()],
+        ancestry: Vec::new(),
+    };
+    let id = engine.create_from_event(&event);
+    serde_json::json!({ "id": id })
+}
+
+#[tauri::command]
+pub fn get_investigation_detail(
+    engine: State<'_, Arc<InvestigationEngine>>,
+    id: String,
+) -> Option<serde_json::Value> {
+    engine.get_investigation(&id).map(|detail| {
+        serde_json::to_value(&detail).unwrap_or_default()
+    })
+}
+
+#[tauri::command]
+pub fn list_investigations(
+    engine: State<'_, Arc<InvestigationEngine>>,
+) -> Vec<serde_json::Value> {
+    engine.open_investigations().iter().map(|inv| {
+        serde_json::to_value(inv).unwrap_or_default()
+    }).collect()
+}
+
+#[tauri::command]
+pub fn open_session(
+    sessions: State<'_, Arc<SessionManager>>,
+    investigation_id: String,
+) -> Option<serde_json::Value> {
+    sessions.open_session(&investigation_id).map(|s| {
+        serde_json::to_value(&s).unwrap_or_default()
+    })
+}
+
+#[tauri::command]
+pub fn get_graph_subgraph(
+    graph: State<'_, Arc<GraphIntelligenceLayer>>,
+    pid: u32,
+) -> Vec<serde_json::Value> {
+    graph.process_subgraph(pid).iter().map(|(node, edges)| {
+        serde_json::json!({
+            "node": serde_json::to_value(node).unwrap_or_default(),
+            "edges": serde_json::to_value(edges).unwrap_or_default(),
+        })
+    }).collect()
 }
